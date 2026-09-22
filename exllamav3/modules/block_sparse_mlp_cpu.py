@@ -13,6 +13,7 @@ _split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0"
 # bracket is the true exposed stall: it runs after the GPU's own expert work, so any time
 # there is worker lateness the GPU could not hide.
 _split_prof = bool(os.environ.get("EXL3_SPLIT_PROF"))
+_split_prof_interval = max(1, int(os.environ.get("EXL3_SPLIT_PROF_INTERVAL", "2048")))
 _sprof = {"issue": [], "wait": []}
 
 def _sprof_wrap(kind, layer, fn):
@@ -23,7 +24,7 @@ def _sprof_wrap(kind, layer, fn):
     ev1.record()
     recs = _sprof[kind]
     recs.append((layer, ev0, ev1))
-    if kind == "wait" and len(recs) >= 2048:
+    if kind == "wait" and len(recs) >= _split_prof_interval:
         for k, rs in _sprof.items():
             ts = [(l, a.elapsed_time(b)) for l, a, b in rs if b.query()]
             if not ts:
@@ -93,6 +94,10 @@ class BlockSparseMLP_CPU:
         self.cpu_offload = False
         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
         self._split_map = None        # dynamic placement: router id -> physical slot
+        self._split_perm = None       # split placement: router id -> original expert id
+        self._split_perm_inv = None   # split placement: original expert id -> router id
+        self._split_forced_ids = None # forced quarantine: original ids pinned to the CPU tail
+        self._split_seeded = False     # stats placement starts hot, then queue-drain swaps adapt
 
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
@@ -173,6 +178,17 @@ class BlockSparseMLP_CPU:
             if self.per_expert_scale is not None:
                 self.per_expert_scale = self.per_expert_scale[
                     perm_t.to(self.per_expert_scale.device)].contiguous()
+            if self._split_forced_ids is not None:
+                # Redundant invariant check (load-time validation already ran): the router now
+                # emits permuted ids, so verify the forward/inverse maps agree and that the
+                # quarantined ids really landed on the CPU tail
+                inv = self._split_perm_inv
+                first = self.cpu_split_first
+                assert len(inv) == self.num_experts and len(self._split_perm) == self.num_experts
+                assert all(inv[self._split_perm[j]] == j for j in range(self.num_experts)), \
+                    f"{self.key}: forced placement forward/inverse mismatch"
+                assert all(inv[e] >= first for e in self._split_forced_ids), \
+                    f"{self.key}: quarantined expert not on the CPU tail"
         # Dynamic placement state: router->physical-slot map (identity start), decayed
         # selection counts, and the shared module registry the sweep walks. The first
         # registered module owns the step counter
@@ -198,6 +214,10 @@ class BlockSparseMLP_CPU:
              self.num_local_experts, self.routing_first, self.routing_last) = self._split_saved
             self._split_saved = None
             self.cpu_split_first = None
+            self._split_perm = None
+            self._split_perm_inv = None
+            self._split_forced_ids = None
+            self._split_seeded = False
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
                 if reg is not None and self in reg:
@@ -297,10 +317,19 @@ class BlockSparseMLP_CPU:
 
     @override
     def can_defer_load(self):
-        # The frequency-permuted expert split reads the router tensors right after load (to
-        # permute them); deferred fills would land after that read and be lost
+        # The frequency-permuted expert split and the forced-quarantine split both read the
+        # router tensors right after load (to permute them); deferred fills would land after
+        # that read and be lost
+        # Only split MoE layers read and permute router tensors during load. Keep deferred
+        # loading for the separately configured MTP component (moe_cpu_split=0) and for all
+        # non-split layers, even when a quarantine probe is exported process-wide.
         if (
-            int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0)) > 0 and
+            os.environ.get("EXL3_MOE_CPU_EXPERTS") and
+            int(getattr(self.config.infer_params, "moe_cpu_split", 0) or 0) > 0
+        ):
+            return False
+        if (
+            int(getattr(self.config.infer_params, "moe_cpu_split", 0) or 0) > 0 and
             os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         ):
             return False
@@ -438,26 +467,28 @@ class BlockSparseMLP_CPU:
         cpu = torch.device("cpu")
         first = self.num_experts - split_k
 
-        # Same eligibility probes as the whole-layer path, on the tail experts
-        probe = ([self.gates[first]] if self.gated else []) + [self.ups[first], self.downs[first]]
-        for l in probe:
-            if stc.get_tensor(l.key + ".mul1", cpu, optional = True) is None:
-                print(f" !! {self.key}: experts are not mul1, CPU split skipped")
-                return False
         def hdr_shape(l):
             return stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-        for l in probe:
-            if hdr_shape(l)[-1] // 16 > 8:
-                print(f" !! {self.key}: K > 8, CPU split skipped")
-                return False
-        def bias_keys(ls):
-            has = [(l.key + ".bias") in stc.tensor_file_map for l in ls[first:]]
-            if any(has) and not all(has):
-                print(f" !! {self.key}: mixed expert biases, CPU split skipped")
-                return None
-            return all(has)
-        checks = [bias_keys(ls) for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]]
-        if any(c is None for c in checks):
+        # Same eligibility probes as the whole-layer path, on the experts that will actually be
+        # offloaded (the current tail of each projection list). Returns a reason string on
+        # failure, None when eligible. The forced-quarantine path re-runs this after its
+        # permutation, since that changes the offloaded set.
+        def _check_offload_set():
+            probe = ([self.gates[first]] if self.gated else []) + [self.ups[first], self.downs[first]]
+            for l in probe:
+                if stc.get_tensor(l.key + ".mul1", cpu, optional = True) is None:
+                    return "experts are not mul1"
+            for l in probe:
+                if hdr_shape(l)[-1] // 16 > 8:
+                    return "K > 8"
+            for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]:
+                has = [(l.key + ".bias") in stc.tensor_file_map for l in ls[first:]]
+                if any(has) and not all(has):
+                    return "mixed expert biases"
+            return None
+        why = _check_offload_set()
+        if why:
+            print(f" !! {self.key}: {why}, CPU split skipped")
             return False
 
         # Optional frequency-guided placement (EXL3_MOE_CPU_SPLIT_STATS = json of per-layer
@@ -468,6 +499,8 @@ class BlockSparseMLP_CPU:
         # space. Measured on lfm2.5: the coldest 12/32 experts draw ~8% of selections vs
         # 37.5% uniform, cutting the CPU share per layer ~4.5x
         self._split_perm = None
+        self._split_perm_inv = None
+        self._split_forced_ids = None
         self._split_saved_lists = (self.gates, self.ups, self.downs)
         # Dynamic placement (default; EXL3_MOE_CPU_SWAP=0 disables): both the GPU's E - k
         # slots and the worker's k slots hold a CHANGING set of experts; a per-layer
@@ -475,27 +508,134 @@ class BlockSparseMLP_CPU:
         # both experts from the checkpoint: the promoted one into the GPU slot tensors in
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
-        self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
-            and not self.tid2eid_key
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+        swap_requested = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0"
+        seed_requested = os.environ.get("EXL3_MOE_CPU_SWAP_SEED", "0") == "1"
+        if seed_requested and not stats_path:
+            raise ValueError("EXL3_MOE_CPU_SWAP_SEED=1 requires EXL3_MOE_CPU_SPLIT_STATS")
+        if seed_requested and not swap_requested:
+            raise ValueError("EXL3_MOE_CPU_SWAP_SEED=1 requires EXL3_MOE_CPU_SWAP=1")
+        # Seed mode delays dynamic-state creation until after the stats permutation below.
+        # cpu_post_load then constructs the identity router->physical-slot map in permuted
+        # router space, which means the profiled hot experts are resident at token zero.
+        self._split_seeded = False
+        self._split_dynamic = swap_requested and not self.tid2eid_key and not seed_requested
+        # Optional explicit quarantine for a known-bad GPU expert. The normal split is a
+        # contiguous [0, first) GPU slice; this opt-in permutation keeps the requested original
+        # expert ids in the CPU tail while preserving the same number of GPU slots. It reuses the
+        # existing router/list permutation machinery below and is intended for correctness probes
+        # and safe production pinning after validation, not as a benchmark default.
+        forced_cpu = os.environ.get("EXL3_MOE_CPU_EXPERTS")
+        if forced_cpu and self.tid2eid_key:
+            print(f" !! {self.key}: EXL3_MOE_CPU_EXPERTS ignored, tid2eid remap present")
+            forced_cpu = None
+        if forced_cpu:
+            try:
+                forced = list(dict.fromkeys(int(x.strip()) for x in forced_cpu.split(",") if x.strip()))
+            except ValueError as exc:
+                raise ValueError(f"invalid EXL3_MOE_CPU_EXPERTS={forced_cpu!r}") from exc
+            if not forced:
+                raise ValueError(f"EXL3_MOE_CPU_EXPERTS={forced_cpu!r} selects no experts")
+            if any(e < 0 or e >= self.num_experts for e in forced):
+                raise ValueError(
+                    f"EXL3_MOE_CPU_EXPERTS contains an expert outside [0,{self.num_experts}): "
+                    f"{forced_cpu!r}"
+                )
+            if len(forced) > split_k:
+                raise ValueError(
+                    f"EXL3_MOE_CPU_EXPERTS requests {len(forced)} experts but split has {split_k} CPU slots"
+                )
+            # Deterministic placement: the forced ids head the CPU tail (worker slots
+            # first..first+len(forced), in the order given); the remaining slots fill with the
+            # coldest ids in descending order, so the mapping never depends on iteration order
+            tail = forced[:]
+            for e in range(self.num_experts - 1, -1, -1):
+                if e not in tail and len(tail) < split_k:
+                    tail.append(e)
+            self._split_perm = [e for e in range(self.num_experts) if e not in tail] + tail
+            # Original id -> router id inverse, so any consumer holding an original id can
+            # translate back (quarantine bookkeeping, the swap path, diagnostics)
+            perm_inv = [0] * self.num_experts
+            for j, e in enumerate(self._split_perm):
+                perm_inv[e] = j
+            if sorted(self._split_perm) != list(range(self.num_experts)):
+                raise ValueError(f"{self.key}: EXL3_MOE_CPU_EXPERTS placement is not a permutation")
+            if any(perm_inv[self._split_perm[j]] != j for j in range(self.num_experts)):
+                raise ValueError(f"{self.key}: EXL3_MOE_CPU_EXPERTS inverse placement is inconsistent")
+            if self._split_perm[first:] != tail:
+                raise ValueError(f"{self.key}: EXL3_MOE_CPU_EXPERTS tail does not match the request")
+            if any(perm_inv[e] < first for e in forced):
+                raise ValueError(f"{self.key}: EXL3_MOE_CPU_EXPERTS put a forced expert on the GPU slice")
+            self._split_perm_inv = perm_inv
+            self._split_forced_ids = tuple(forced)
+            # A forced layer is static by construction: the dynamic sweep promotes a hot
+            # CPU-resident expert into a GPU slot, which would undo the quarantine
+            if os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0":
+                print(f" !! {self.key}: EXL3_MOE_CPU_SWAP forced to 0 (static) by EXL3_MOE_CPU_EXPERTS")
+            self._split_dynamic = False
+            if self.gated:
+                self.gates = [self.gates[e] for e in self._split_perm]
+            self.ups = [self.ups[e] for e in self._split_perm]
+            self.downs = [self.downs[e] for e in self._split_perm]
+            # The offloaded set changed, so re-check the permuted tail against the same probes;
+            # fail loudly instead of silently running an ineligible expert on the worker
+            why = _check_offload_set()
+            if why:
+                raise ValueError(
+                    f"EXL3_MOE_CPU_EXPERTS offload set is ineligible for the CPU worker "
+                    f"({why}): {self.key}"
+                )
+            print(f" -- forced CPU experts: {self.key} "
+                  + " ".join(f"e{e}->slot{self._split_perm_inv[e] - first}" for e in forced))
+            forced_cpu = True
+
         if stats_path and self._split_dynamic:
             # Static placement from a stats file only applies with dynamic swapping disabled
             print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, set EXL3_MOE_CPU_SWAP=0 to use it")
             stats_path = None
         if stats_path and self.tid2eid_key:
+            if seed_requested:
+                raise ValueError(
+                    f"{self.key}: EXL3_MOE_CPU_SWAP_SEED is incompatible with tid2eid remapping"
+                )
             print(f" !! {self.key}: tid2eid remap present, tail placement unpermuted")
+            stats_path = None
+        if stats_path and forced_cpu:
+            if seed_requested:
+                raise ValueError(
+                    f"{self.key}: EXL3_MOE_CPU_SWAP_SEED is incompatible with EXL3_MOE_CPU_EXPERTS"
+                )
+            print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, EXL3_MOE_CPU_EXPERTS pins the tail")
             stats_path = None
         if stats_path:
             import json
             counts = json.load(open(stats_path)).get(self.key)
             if counts is not None and len(counts) == self.num_experts:
                 perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
+                if sorted(perm) != list(range(self.num_experts)):
+                    raise ValueError(f"{self.key}: stats placement is not a permutation")
                 self._split_perm = perm
+                self._split_perm_inv = [0] * self.num_experts
+                for router_id, checkpoint_id in enumerate(perm):
+                    self._split_perm_inv[checkpoint_id] = router_id
+                if any(self._split_perm_inv[checkpoint_id] != router_id
+                       for router_id, checkpoint_id in enumerate(perm)):
+                    raise ValueError(f"{self.key}: stats placement inverse is inconsistent")
                 if self.gated:
                     self.gates = [self.gates[e] for e in perm]
                 self.ups = [self.ups[e] for e in perm]
                 self.downs = [self.downs[e] for e in perm]
+                if seed_requested:
+                    # The lists and router will be permuted in cpu_post_load.  From that
+                    # point the identity map is a correctly seeded hot placement; dynamic
+                    # sweeps may subsequently exchange router IDs between physical slots.
+                    self._split_dynamic = True
+                    self._split_seeded = True
             else:
+                if seed_requested:
+                    raise ValueError(
+                        f"{self.key}: EXL3_MOE_CPU_SWAP_SEED requires one complete stats vector"
+                    )
                 print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
 
         self.device = torch.device(device)
@@ -562,7 +702,7 @@ class BlockSparseMLP_CPU:
         self.routing_first = 0
         self.routing_last = first
         self.cpu_split_first = first
-        mode = "dynamic" if self._split_dynamic else "static"
+        mode = "seed" if self._split_seeded else ("dynamic" if self._split_dynamic else "static")
         print(f" -- CPU split experts (worker, {mode}): {self.key} "
               f"[{first}..{self.num_experts}) of {self.num_experts}")
         return True
@@ -605,6 +745,10 @@ class BlockSparseMLP_CPU:
         pairs (per-expert quant width differences). Decays the counts afterwards so the
         stats track recent routing."""
         first = self.cpu_split_first
+        # Forced-quarantine layers are static: they are never registered in moe_cpu_swap_modules,
+        # so reaching here means the placement bookkeeping is inconsistent
+        assert self._split_forced_ids is None, \
+            f"{self.key}: forced-quarantine layer must not enter the dynamic placement sweep"
         hyst = float(os.environ.get("EXL3_MOE_CPU_SWAP_HYST", 2.0))
         mp = self._split_map.cpu()
         hist = self._split_hist.cpu()
@@ -620,6 +764,15 @@ class BlockSparseMLP_CPU:
         tail = [(float(hist[r]), r) for r in range(self.num_experts) if int(mp[r]) >= first]
         head.sort()
         tail.sort(reverse = True)
+        debug = bool(os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG"))
+        if debug:
+            total_hits = float(hist.sum())
+            cpu_hits = sum(c for c, _ in tail)
+            hottest_cpu = ",".join(f"{r}:{c:.1f}" for c, r in tail[:3]) or "-"
+            coldest_gpu = ",".join(f"{r}:{c:.1f}" for c, r in head[:3]) or "-"
+            print(f" -- expert placement: {self.key} hits {total_hits:.1f} "
+                  f"cpu {cpu_hits:.1f} ({100.0 * cpu_hits / total_hits if total_hits else 0.0:.1f}%) "
+                  f"hot_cpu [{hottest_cpu}] cold_gpu [{coldest_gpu}]", flush = True)
         nswaps = 0
         for (c_cold, r_cold), (c_hot, r_hot) in zip(head, tail):
             if nswaps >= budget or c_hot < max(hyst * max(c_cold, 1.0), floor):
@@ -631,6 +784,8 @@ class BlockSparseMLP_CPU:
                 assert mp.sort().values.equal(torch.arange(self.num_experts)), \
                     f"{self.key}: placement map is not a permutation after sweep"
             self._split_map.copy_(mp.to(self._split_map.device))
+        if debug:
+            print(f" -- expert placement: {self.key} swaps {nswaps}", flush = True)
         self._split_hist.mul_(0.5)
         return nswaps
 
@@ -639,13 +794,22 @@ class BlockSparseMLP_CPU:
         in-place tensor copy), demote r_cold by map update. mp is the host-side map, updated
         on success."""
         stc = self.config.stc
+        # ``r_*`` are router-space IDs. A seeded stats profile reordered the router
+        # columns and the physical expert lists at load, while the checkpoint remains in
+        # original expert order. Later swaps must translate before reading/reinstalling
+        # weights; using raw router IDs here silently exchanges unrelated experts.
+        def checkpoint_id(router_id):
+            return self._split_perm[router_id] if self._split_perm is not None else router_id
+
+        e_cold = checkpoint_id(r_cold)
+        e_hot = checkpoint_id(r_hot)
         slot = int(mp[r_cold])
         full_g, full_u, full_d = self._split_saved_lists_ref()
         proj = ([(full_g, self.gates)] if self.gated else []) \
             + [(full_u, self.ups), (full_d, self.downs)]
         pairs = []
         for full, cur in proj:
-            src_key = full[r_hot].key
+            src_key = full[e_hot].key
             dst = cur[slot].inner
             shp = stc.list_tensors(src_key)[src_key + ".trellis"]["shape"]
             if list(shp) != list(dst.trellis.shape):
@@ -654,8 +818,8 @@ class BlockSparseMLP_CPU:
         # The demoted expert also must match the worker slot's tenant (= the promoted
         # expert's shapes, since they exchange homes) for the in-place arena copy
         for full, _ in proj:
-            k_cold = full[r_cold].key
-            k_hot = full[r_hot].key
+            k_cold = full[e_cold].key
+            k_hot = full[e_hot].key
             sc = stc.list_tensors(k_cold)[k_cold + ".trellis"]["shape"]
             sh = stc.list_tensors(k_hot)[k_hot + ".trellis"]["shape"]
             if list(sc) != list(sh):
@@ -675,8 +839,8 @@ class BlockSparseMLP_CPU:
         # from its own checkpoint handle into the arena in place (we are quiesced), and the
         # streamed-prefill aux copies for that slot update to match
         cpu_local = int(mp[r_hot]) - self.cpu_split_first
-        keys = ([full_g[r_cold].key] if self.gated else []) \
-            + [full_u[r_cold].key, full_d[r_cold].key]
+        keys = ([full_g[e_cold].key] if self.gated else []) \
+            + [full_u[e_cold].key, full_d[e_cold].key]
         self.cpu_host.install_expert(self.cpu_layer_idx, cpu_local, keys)
         aux = self.cpu_host.aux.get(self.cpu_layer_idx)
         if aux:
@@ -688,7 +852,7 @@ class BlockSparseMLP_CPU:
                 if lst is None or lst[cpu_local] is None:
                     continue
                 suffix = "." + name.split("_")[0]
-                t = stc.get_tensor(full[r_cold].key + suffix, lst[cpu_local].device,
+                t = stc.get_tensor(full[e_cold].key + suffix, lst[cpu_local].device,
                                    optional = name.startswith("bias"), float2half = True)
                 if t is not None:
                     lst[cpu_local].copy_(t)

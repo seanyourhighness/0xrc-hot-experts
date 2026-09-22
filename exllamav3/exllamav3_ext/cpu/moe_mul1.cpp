@@ -67,6 +67,11 @@ namespace {
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
 constexpr float HAD_SCALE = 0.088388347648f;
 constexpr int MAX_M = 4;
+const bool g_k3_pair = []()
+{
+    const char* e = getenv("EXL3_MOE_K3_PAIR");
+    return e && atoi(e) == 1;
+}();
 
 #if defined(__GNUC__) && defined(__linux__)
 #define M1_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
@@ -914,6 +919,36 @@ constexpr std::array<uint8_t, 64> make_row_byte_indices()
     return idx;
 }
 
+// K3 has a useful second pairing opportunity below row 8. For those pairs, the odd row's
+// 16-bit window can fall one byte before the even row's three-byte window in one half-row.
+// Start that half-row one byte earlier; the same gathered bytes then contain both rows.
+template <int bits, int row>
+constexpr std::array<uint8_t, 64> make_row_byte_pair_indices()
+{
+    std::array<uint8_t, 64> idx{};
+    const auto inv = make_tc_perm_inv();
+    constexpr int words32 = bits * 256 / 32;
+    for (int col = 0; col < 16; ++col)
+    {
+        const int t = inv[row * 16 + col];
+        const int b0 = t * bits + bits - 16 + 256 * bits;
+        const int b1 = b0 + 16;
+        const int w0 = (b0 / 32) % words32;
+        const int w1 = ((b1 - 1) / 32) % words32;
+        const int shift = ((b1 - 1) / 32 + 1) * 32 - b1;
+        const int adjust = (shift % 8 < bits) ? 1 : 0;
+        const int fb = shift / 8 - adjust;
+        for (int byte = 0; byte < 4; ++byte)
+        {
+            const int mb = fb + byte;
+            idx[col * 4 + byte] = static_cast<uint8_t>(
+                mb < 0 ? w0 * 4 + 4 + mb
+                       : (mb < 4 ? w1 * 4 + mb : w0 * 4 + (mb - 4)));
+        }
+    }
+    return idx;
+}
+
 // For bits > 4 (tile spans 4 zmms): which gathered bytes come from the (p2,p3) pair.
 // vpermt2b consumes idx bits [6:0], so raw indices >= 128 address the high pair directly.
 template <int bits, int row>
@@ -935,6 +970,13 @@ constexpr bool byte_pair_ok()
     for (int col = 0; col < 16; ++col)
         if (row_shift<bits, row>(col) % 8 < bits) return false;
     return true;
+}
+
+template <int bits, int row>
+constexpr int pair_row_shift(int col)
+{
+    const int shift = row_shift<bits, row>(col);
+    return shift % 8 < bits ? shift % 8 + 8 : shift % 8;
 }
 
 template <int bits, int row>
@@ -967,6 +1009,16 @@ inline __m512i gather_row_bytes(__m512i p0, __m512i p1, __m512i p2, __m512i p3)
     }
 }
 
+template <int bits, int row>
+M1_TARGET_VBMI
+inline __m512i gather_row_pair_bytes(__m512i p0, __m512i p1, __m512i p2, __m512i p3)
+{
+    alignas(64) static constexpr auto bidx = make_row_byte_pair_indices<bits, row>();
+    const __m512i idx = _mm512_load_si512(bidx.data());
+    (void) p2; (void) p3;
+    return _mm512_permutex2var_epi8(p0, idx, p1);
+}
+
 // delta = 0 extracts `row` itself; delta = bits extracts row+1 from row's gathered bytes
 template <int bits, int row, int delta>
 M1_TARGET_VBMI
@@ -975,6 +1027,20 @@ inline __m512i shift_mask_row(__m512i g)
     constexpr int s0 = row_shift<bits, row>(0) % 8 - delta;
     constexpr int s1 = row_shift<bits, row>(8) % 8 - delta;
     static_assert(s0 >= 0 && s1 >= 0, "pairing delta exceeds sub-byte shift headroom");
+    if constexpr (s0 == s1)
+        return _mm512_and_si512(_mm512_srli_epi32(g, s0), _mm512_set1_epi32(0xffff));
+    else
+        return _mm512_and_si512(_mm512_mask_blend_epi32(0xff00,
+            _mm512_srli_epi32(g, s0), _mm512_srli_epi32(g, s1)), _mm512_set1_epi32(0xffff));
+}
+
+template <int bits, int row, int delta>
+M1_TARGET_VBMI
+inline __m512i shift_mask_pair_row(__m512i g)
+{
+    constexpr int s0 = pair_row_shift<bits, row>(0) - delta;
+    constexpr int s1 = pair_row_shift<bits, row>(8) - delta;
+    static_assert(s0 >= 0 && s1 >= 0, "paired K3 shift exceeds gathered window");
     if constexpr (s0 == s1)
         return _mm512_and_si512(_mm512_srli_epi32(g, s0), _mm512_set1_epi32(0xffff));
     else
@@ -995,7 +1061,24 @@ inline void vbmi_band_rows
         constexpr int R = P * 2;
         const __m512i mult = _mm512_set1_epi32(static_cast<int32_t>(MUL1_MULT));
         __m512i c0, c1;
-        if constexpr (byte_pair_ok<bits, R>())
+        // The R=4 pair crosses a different packed-word boundary on the odd row, so it still
+        // needs the original two-gather path. The other K3 pairs are safe with the widened
+        // four-byte window (and rows 8-15 were already byte-paired before this specialization).
+        if constexpr (bits == 3 && R != 4)
+        {
+            if (g_k3_pair)
+            {
+                const __m512i g = gather_row_pair_bytes<bits, R>(p0, p1, p2, p3);
+                c0 = shift_mask_pair_row<bits, R, 0>(g);
+                c1 = shift_mask_pair_row<bits, R, bits>(g);
+            }
+            else
+            {
+                c0 = shift_mask_row<bits, R, 0>(gather_row_bytes<bits, R>(p0, p1, p2, p3));
+                c1 = shift_mask_row<bits, R + 1, 0>(gather_row_bytes<bits, R + 1>(p0, p1, p2, p3));
+            }
+        }
+        else if constexpr (byte_pair_ok<bits, R>())
         {
             const __m512i g = gather_row_bytes<bits, R>(p0, p1, p2, p3);
             c0 = shift_mask_row<bits, R, 0>(g);
@@ -1705,6 +1788,36 @@ inline bool pin_threads_enabled()
     return v;
 }
 
+// Keep the persistent pool's Linux idle policy tunable without changing the default. A lower
+// spin limit reduces CPU contention while a higher limit avoids waking from the 50-us nap when
+// decode phases are close together. These are diagnostics first: the speed gate must still use
+// the complete end-to-end worker and correctness harness.
+inline int worker_spin_limit()
+{
+    static const int v = [] {
+        const char* e = std::getenv("EXL3_MOE_CPU_SPIN_LIMIT");
+        if (!e || !*e) return 65536;
+        char* end = nullptr;
+        const long parsed = std::strtol(e, &end, 10);
+        if (end == e) return 65536;
+        return static_cast<int>(std::max(0L, std::min(4000000L, parsed)));
+    }();
+    return v;
+}
+
+inline int worker_nap_us()
+{
+    static const int v = [] {
+        const char* e = std::getenv("EXL3_MOE_CPU_NAP_US");
+        if (!e || !*e) return 50;
+        char* end = nullptr;
+        const long parsed = std::strtol(e, &end, 10);
+        if (end == e) return 50;
+        return static_cast<int>(std::max(0L, std::min(5000L, parsed)));
+    }();
+    return v;
+}
+
 struct Pool
 {
     int spawned = 0;
@@ -1744,14 +1857,16 @@ struct Pool
         pin_self(idx);
         uint64_t seen = 0;
         int idle = 0;
+        const int spin_limit = worker_spin_limit();
+        const int nap_us = worker_nap_us();
         while (true) {
             const uint64_t g = dispatch.load(std::memory_order_acquire);
             if (g == seen)
             {
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
-                if (++idle < 65536) { cpu_pause(); continue; }
+                if (++idle < spin_limit) { cpu_pause(); continue; }
 #ifdef __linux__
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                std::this_thread::sleep_for(std::chrono::microseconds(nap_us));
 #else
                 // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone

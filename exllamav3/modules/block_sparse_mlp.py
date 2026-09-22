@@ -43,6 +43,12 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
+# Debug-only routing probe for split-boundary investigations. It is completely inactive unless
+# an expert id is requested, and is intentionally limited so a diagnostic run cannot flood logs.
+_TRACE_EXPERT = int(os.environ.get("EXL3_MOE_TRACE_EXPERT", "-1"))
+_TRACE_LIMIT = int(os.environ.get("EXL3_MOE_TRACE_LIMIT", "32"))
+_trace_hits = 0
+
 @dataclass
 class FusedBuffers:
     temp_state_g: torch.Tensor
@@ -972,6 +978,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.routing_device is not None:
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
+
+        # Optional boundary diagnostic: only inspect decode-sized batches and only synchronize
+        # when the requested physical/router expert is actually selected. This is for finding
+        # one bad GPU/CPU boundary expert; it must remain off in benchmark and service runs.
+        global _trace_hits
+        if (
+            _TRACE_EXPERT >= 0 and _trace_hits < _TRACE_LIMIT and bsz <= MAX_BSZN and
+            bool((selected_experts == _TRACE_EXPERT).any().item())
+        ):
+            print(
+                f" -- moe trace expert={_TRACE_EXPERT} layer={self.key} bsz={bsz} "
+                f"first_cpu={self.cpu_split_first} selected="
+                f"{selected_experts.detach().cpu().reshape(-1).tolist()}",
+                flush = True,
+            )
+            _trace_hits += 1
 
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
