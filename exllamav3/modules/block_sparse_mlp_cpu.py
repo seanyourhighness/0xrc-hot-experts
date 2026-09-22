@@ -109,6 +109,7 @@ class BlockSparseMLP_CPU:
         self._split_map = None        # dynamic placement: router id -> physical slot
         self._split_perm = None       # profile placement: router id -> checkpoint expert id
         self._split_perm_inv = None   # checkpoint expert id -> router id
+        self._split_seeded = False    # adaptive placement starts from a validated profile
 
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
@@ -216,6 +217,7 @@ class BlockSparseMLP_CPU:
             self.cpu_split_first = None
             self._split_perm = None
             self._split_perm_inv = None
+            self._split_seeded = False
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
                 if reg is not None and self in reg:
@@ -493,14 +495,27 @@ class BlockSparseMLP_CPU:
         # both experts from the checkpoint: the promoted one into the GPU slot tensors in
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
-        self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "0") != "0" \
-            and not self.tid2eid_key
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+        swap_requested = os.environ.get("EXL3_MOE_CPU_SWAP", "0") != "0"
+        seed_requested = os.environ.get("EXL3_MOE_CPU_SWAP_SEED", "0") == "1"
+        if seed_requested and not stats_path:
+            raise ValueError("EXL3_MOE_CPU_SWAP_SEED=1 requires EXL3_MOE_CPU_SPLIT_STATS")
+        if seed_requested and not swap_requested:
+            raise ValueError("EXL3_MOE_CPU_SWAP_SEED=1 requires EXL3_MOE_CPU_SWAP=1")
+        self._split_seeded = False
+        # Seed mode constructs dynamic state only after the profile has been validated and
+        # applied. This prevents an unprofiled online placement from being mistaken for the
+        # qualified profile-seeded policy.
+        self._split_dynamic = swap_requested and not self.tid2eid_key and not seed_requested
         if stats_path and self._split_dynamic:
             # Static placement from a stats file only applies with dynamic swapping disabled
             print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, set EXL3_MOE_CPU_SWAP=0 to use it")
             stats_path = None
         if stats_path and self.tid2eid_key:
+            if seed_requested:
+                raise ValueError(
+                    f"{self.key}: EXL3_MOE_CPU_SWAP_SEED is incompatible with tid2eid remapping"
+                )
             print(f" !! {self.key}: tid2eid remap present, tail placement unpermuted")
             stats_path = None
         if stats_path:
@@ -519,6 +534,9 @@ class BlockSparseMLP_CPU:
                 self.gates = [self.gates[e] for e in perm]
             self.ups = [self.ups[e] for e in perm]
             self.downs = [self.downs[e] for e in perm]
+            if seed_requested:
+                self._split_dynamic = True
+                self._split_seeded = True
 
         self.device = torch.device(device)
 
@@ -584,7 +602,8 @@ class BlockSparseMLP_CPU:
         self.routing_first = 0
         self.routing_last = first
         self.cpu_split_first = first
-        mode = "dynamic" if self._split_dynamic else "static"
+        mode = "seeded-adaptive" if self._split_seeded else \
+            ("dynamic" if self._split_dynamic else "static")
         print(f" -- CPU split experts (worker, {mode}): {self.key} "
               f"[{first}..{self.num_experts}) of {self.num_experts}")
         return True
@@ -661,13 +680,21 @@ class BlockSparseMLP_CPU:
         in-place tensor copy), demote r_cold by map update. mp is the host-side map, updated
         on success."""
         stc = self.config.stc
+        # Swap decisions use router IDs after profile placement has permuted router columns.
+        # Checkpoint keys remain in original expert order, so translate both sides before any
+        # tensor read or worker reinstall.
+        def checkpoint_id(router_id):
+            return self._split_perm[router_id] if self._split_perm is not None else router_id
+
+        e_cold = checkpoint_id(r_cold)
+        e_hot = checkpoint_id(r_hot)
         slot = int(mp[r_cold])
         full_g, full_u, full_d = self._split_saved_lists_ref()
         proj = ([(full_g, self.gates)] if self.gated else []) \
             + [(full_u, self.ups), (full_d, self.downs)]
         pairs = []
         for full, cur in proj:
-            src_key = full[r_hot].key
+            src_key = full[e_hot].key
             dst = cur[slot].inner
             shp = stc.list_tensors(src_key)[src_key + ".trellis"]["shape"]
             if list(shp) != list(dst.trellis.shape):
@@ -676,8 +703,8 @@ class BlockSparseMLP_CPU:
         # The demoted expert also must match the worker slot's tenant (= the promoted
         # expert's shapes, since they exchange homes) for the in-place arena copy
         for full, _ in proj:
-            k_cold = full[r_cold].key
-            k_hot = full[r_hot].key
+            k_cold = full[e_cold].key
+            k_hot = full[e_hot].key
             sc = stc.list_tensors(k_cold)[k_cold + ".trellis"]["shape"]
             sh = stc.list_tensors(k_hot)[k_hot + ".trellis"]["shape"]
             if list(sc) != list(sh):
@@ -697,8 +724,8 @@ class BlockSparseMLP_CPU:
         # from its own checkpoint handle into the arena in place (we are quiesced), and the
         # streamed-prefill aux copies for that slot update to match
         cpu_local = int(mp[r_hot]) - self.cpu_split_first
-        keys = ([full_g[r_cold].key] if self.gated else []) \
-            + [full_u[r_cold].key, full_d[r_cold].key]
+        keys = ([full_g[e_cold].key] if self.gated else []) \
+            + [full_u[e_cold].key, full_d[e_cold].key]
         self.cpu_host.install_expert(self.cpu_layer_idx, cpu_local, keys)
         aux = self.cpu_host.aux.get(self.cpu_layer_idx)
         if aux:
@@ -710,7 +737,7 @@ class BlockSparseMLP_CPU:
                 if lst is None or lst[cpu_local] is None:
                     continue
                 suffix = "." + name.split("_")[0]
-                t = stc.get_tensor(full[r_cold].key + suffix, lst[cpu_local].device,
+                t = stc.get_tensor(full[e_cold].key + suffix, lst[cpu_local].device,
                                    optional = name.startswith("bias"), float2half = True)
                 if t is not None:
                     lst[cpu_local].copy_(t)
