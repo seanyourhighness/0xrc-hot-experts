@@ -1,12 +1,15 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+import os
 from ..util.device_copy import to_device
 import weakref
+from safetensors.torch import load_file
 
 from ..model.config import Config
 from ..model.model import Model
 from ..modules import Embedding, Linear, GatedResidual
+from ..modules.quant.exl3 import LinearEXL3
 from ..modules.module import Module
 from ..modules.arch_specific.qwen4_exp_mtp import Qwen4ExpMTPInputLayer
 from ..modules.attn import prepare_for_attn
@@ -122,6 +125,9 @@ class Qwen4ExpMTPModel(Model):
         self.target_embed = None
         self.target_lm_head = None
         self.attached_model = None
+        self.mtp_sub_lm_head = None
+        self.mtp_hot_vocab = 0
+        self.mtp_hot_id_map = None
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
@@ -150,6 +156,95 @@ class Qwen4ExpMTPModel(Model):
         assert isinstance(target.modules[-1], Linear), "Expected Linear lm_head as last target module"
         self.target_lm_head = weakref.ref(target.modules[-1])
 
+        hot_path = os.environ.get("EXL3_MTP_HOT_HEAD", "").strip()
+        hot_groups_path = os.environ.get("EXL3_MTP_HOT_GROUPS", "").strip()
+        if hot_path and hot_groups_path:
+            raise ValueError("choose one of EXL3_MTP_HOT_HEAD or EXL3_MTP_HOT_GROUPS")
+        if hot_groups_path:
+            if target.loaded_tp:
+                raise ValueError("MTP grouped head currently supports single-GPU layer split only")
+            full_head = target.modules[-1].inner
+            if not isinstance(full_head, LinearEXL3):
+                raise ValueError("MTP grouped head requires an EXL3 target lm_head")
+            with open(hot_groups_path, "r", encoding = "utf-8") as f:
+                block_ids = [
+                    int(line) for line in f
+                    if line.strip() and not line.lstrip().startswith("#")
+                ]
+            full_vocab = target.modules[-1].out_features_unpadded
+            if not block_ids or block_ids != sorted(set(block_ids)):
+                raise ValueError("MTP grouped head block IDs must be nonempty, unique, and sorted")
+            if len(block_ids) % 8 or block_ids[-1] >= (full_vocab + 15) // 16:
+                raise ValueError("MTP grouped head requires complete 128-token groups")
+            for offset in range(0, len(block_ids), 8):
+                first = block_ids[offset]
+                if first % 8 or block_ids[offset:offset + 8] != list(range(first, first + 8)):
+                    raise ValueError("MTP grouped head block IDs must be aligned groups of eight")
+            block_idx = torch.tensor(block_ids, device = full_head.trellis.device, dtype = torch.long)
+            token_ids = (
+                block_idx[:, None] * 16 +
+                torch.arange(16, device = block_idx.device)[None, :]
+            ).flatten()
+            if token_ids.numel() != len(block_ids) * 16 or token_ids.max() >= full_vocab:
+                raise ValueError("MTP grouped head may not include a partial final vocabulary block")
+            required = {x for x in target.config.eos_token_id_list if x is not None}
+            if not required.issubset(set(token_ids.cpu().tolist())):
+                raise ValueError("MTP grouped head omits required EOS token IDs")
+            # This is an exact control: retain the original EXL3 quantization and Hadamard
+            # metadata, slicing only the independently transformed 128-token groups.
+            trellis = full_head.trellis.index_select(1, block_idx).contiguous()
+            svh = full_head.svh.index_select(0, token_ids).contiguous()
+            bias = full_head.bias.index_select(0, token_ids).contiguous() \
+                if full_head.bias is not None else None
+            self.mtp_sub_lm_head = LinearEXL3(
+                config = target.config, in_features = full_head.in_features,
+                out_features = token_ids.numel(), suh = full_head.suh, svh = svh,
+                trellis = trellis, mcg = full_head.mcg_tensor, mul1 = full_head.mul1_tensor,
+                bias = bias, out_dtype = full_head.out_dtype, key = "mtp.hot_grouped_lm_head",
+            )
+            embed = target_embed.embedding.weight.index_select(0, token_ids.cpu())
+            self.input_layer.hot_embedding = embed.to(
+                device = full_head.trellis.device, dtype = torch.float16
+            ).contiguous()
+            inverse = torch.full((full_vocab,), -1, device = token_ids.device, dtype = torch.long)
+            inverse[token_ids] = torch.arange(token_ids.numel(), device = token_ids.device)
+            self.input_layer.hot_inverse = inverse
+            self.mtp_hot_id_map = token_ids
+            self.mtp_hot_vocab = token_ids.numel()
+        elif hot_path:
+            if target.loaded_tp:
+                raise ValueError("MTP selected head currently supports single-GPU layer split only")
+            full_head = target.modules[-1].inner
+            if not isinstance(full_head, LinearEXL3):
+                raise ValueError("MTP selected head requires an EXL3 target lm_head")
+            tensors = load_file(hot_path, device = str(full_head.trellis.device))
+            token_ids = tensors.pop("token_ids").long().contiguous()
+            embedding = tensors.pop("embedding").half().contiguous()
+            if token_ids.numel() != embedding.shape[0] or token_ids.numel() % 128:
+                raise ValueError("invalid MTP selected-head token/embedding geometry")
+            if token_ids.unique().numel() != token_ids.numel() or token_ids.min() < 0 \
+                    or token_ids.max() >= target.config.vocab_size:
+                raise ValueError("invalid MTP selected-head token IDs")
+            if embedding.shape[1] != full_head.in_features:
+                raise ValueError("MTP selected-head embedding width does not match target head")
+            required = {x for x in target.config.eos_token_id_list if x is not None}
+            if not required.issubset(set(token_ids.cpu().tolist())):
+                raise ValueError("MTP selected head omits required EOS token IDs")
+            self.mtp_sub_lm_head = LinearEXL3(
+                config = target.config, in_features = full_head.in_features, out_features = token_ids.numel(),
+                suh = tensors.pop("suh"), svh = tensors.pop("svh"), trellis = tensors.pop("trellis"),
+                mcg = tensors.pop("mcg", None), mul1 = tensors.pop("mul1", None),
+                out_dtype = full_head.out_dtype, key = "mtp.hot_lm_head",
+            )
+            if tensors:
+                raise ValueError(f"unexpected MTP selected-head tensors: {sorted(tensors)}")
+            inverse = torch.full((target.config.vocab_size,), -1, device = token_ids.device, dtype = torch.long)
+            inverse[token_ids] = torch.arange(token_ids.numel(), device = token_ids.device)
+            self.input_layer.hot_embedding = embedding
+            self.input_layer.hot_inverse = inverse
+            self.mtp_hot_id_map = token_ids
+            self.mtp_hot_vocab = token_ids.numel()
+
         target_mixer = target.modules[target.logit_layer_idx - 1]
         assert isinstance(target_mixer, GatedResidual) and not target_mixer.use_combine, \
             "Expected the trunk's combine-less mixer immediately before lm_head"
@@ -173,6 +268,14 @@ class Qwen4ExpMTPModel(Model):
         bsz, seq, _ = state.shape
         stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
+        if self.mtp_sub_lm_head is not None:
+            logits = self.mtp_sub_lm_head.forward(state, params)
+            if params.get("export_draft_conf"):
+                conf, sub_ids = torch.max(logits, dim = -1)
+                params["draft_conf"] = conf
+            else:
+                sub_ids = torch.argmax(logits, dim = -1)
+            return self.mtp_hot_id_map[sub_ids]
         ll = self.attached_model().logit_layer_idx
         lm = self.attached_model().modules[ll]
         logits = lm.prepare_for_device(state, params)
