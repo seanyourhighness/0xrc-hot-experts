@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import math
 import os
 import torch
 from ..ext import exllamav3_ext as ext
@@ -14,6 +15,19 @@ _split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0"
 # there is worker lateness the GPU could not hide.
 _split_prof = bool(os.environ.get("EXL3_SPLIT_PROF"))
 _sprof = {"issue": [], "wait": []}
+
+
+def _profile_permutation(counts, num_experts):
+    """Validate one layer's routing census and return stable hot-to-cold expert IDs."""
+    if not isinstance(counts, list) or len(counts) != num_experts:
+        raise ValueError(f"expected {num_experts} expert counts, got {len(counts) if isinstance(counts, list) else 'non-list'}")
+    values = [float(value) for value in counts]
+    if any(not math.isfinite(value) or value < 0 for value in values):
+        raise ValueError("expert counts must be finite and nonnegative")
+    permutation = sorted(range(num_experts), key = lambda expert: (-values[expert], expert))
+    if sorted(permutation) != list(range(num_experts)):
+        raise ValueError("profile placement is not a permutation")
+    return permutation
 
 def _sprof_wrap(kind, layer, fn):
     ev0 = torch.cuda.Event(enable_timing = True)
@@ -93,6 +107,8 @@ class BlockSparseMLP_CPU:
         self.cpu_offload = False
         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
         self._split_map = None        # dynamic placement: router id -> physical slot
+        self._split_perm = None       # profile placement: router id -> checkpoint expert id
+        self._split_perm_inv = None   # checkpoint expert id -> router id
 
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
@@ -198,6 +214,8 @@ class BlockSparseMLP_CPU:
              self.num_local_experts, self.routing_first, self.routing_last) = self._split_saved
             self._split_saved = None
             self.cpu_split_first = None
+            self._split_perm = None
+            self._split_perm_inv = None
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
                 if reg is not None and self in reg:
@@ -299,10 +317,8 @@ class BlockSparseMLP_CPU:
     def can_defer_load(self):
         # The frequency-permuted expert split reads the router tensors right after load (to
         # permute them); deferred fills would land after that read and be lost
-        if (
-            int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0)) > 0 and
-            os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-        ):
+        if (int(getattr(self.config.infer_params, "moe_cpu_split", 0) or 0) > 0
+                and os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")):
             return False
         return super().can_defer_load()
 
@@ -468,14 +484,16 @@ class BlockSparseMLP_CPU:
         # space. Measured on lfm2.5: the coldest 12/32 experts draw ~8% of selections vs
         # 37.5% uniform, cutting the CPU share per layer ~4.5x
         self._split_perm = None
+        self._split_perm_inv = None
         self._split_saved_lists = (self.gates, self.ups, self.downs)
-        # Dynamic placement (default; EXL3_MOE_CPU_SWAP=0 disables): both the GPU's E - k
+        # Dynamic placement is opt-in. Static placement is the safe default and allows a
+        # routing profile to determine the resident hot set without online mutations.
         # slots and the worker's k slots hold a CHANGING set of experts; a per-layer
         # router->slot map applied right after routing decides placement. A swap re-reads
         # both experts from the checkpoint: the promoted one into the GPU slot tensors in
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
-        self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
+        self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "0") != "0" \
             and not self.tid2eid_key
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         if stats_path and self._split_dynamic:
@@ -487,16 +505,20 @@ class BlockSparseMLP_CPU:
             stats_path = None
         if stats_path:
             import json
-            counts = json.load(open(stats_path)).get(self.key)
-            if counts is not None and len(counts) == self.num_experts:
-                perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
-                self._split_perm = perm
-                if self.gated:
-                    self.gates = [self.gates[e] for e in perm]
-                self.ups = [self.ups[e] for e in perm]
-                self.downs = [self.downs[e] for e in perm]
-            else:
-                print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
+            with open(stats_path, encoding = "utf-8") as stats_file:
+                counts = json.load(stats_file).get(self.key)
+            try:
+                perm = _profile_permutation(counts, self.num_experts)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{self.key}: invalid routing profile in {stats_path}: {exc}") from exc
+            self._split_perm = perm
+            self._split_perm_inv = [0] * self.num_experts
+            for router_id, checkpoint_id in enumerate(perm):
+                self._split_perm_inv[checkpoint_id] = router_id
+            if self.gated:
+                self.gates = [self.gates[e] for e in perm]
+            self.ups = [self.ups[e] for e in perm]
+            self.downs = [self.downs[e] for e in perm]
 
         self.device = torch.device(device)
 
