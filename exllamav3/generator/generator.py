@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -122,6 +123,7 @@ class Generator:
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
+        record_draft_ids: bool = False,
         **kwargs
     ):
         """
@@ -184,6 +186,11 @@ class Generator:
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
+
+        :param record_draft_ids:
+            Append every proposed speculative token ID to job.draft_proposal_ids. Diagnostic
+            only; disabled by default because retaining an unbounded Python trace is not a
+            production behavior.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -260,6 +267,7 @@ class Generator:
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
+        self.record_draft_ids = record_draft_ids
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
@@ -831,6 +839,19 @@ class Generator:
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
+        # Experimental transfer-only MTP path.  Keep proposal IDs on the device between draft
+        # positions and make one block D2H copy before target verification.  This deliberately
+        # leaves the full draft lm_head and target verification untouched, so it is a safe
+        # prerequisite/control for a future selected-vocabulary draft head.  The normal path
+        # remains the default and is retained for unsupported confidence-calibrated windows.
+        hot_embedding = getattr(getattr(self.draft_model, "input_layer", None), "hot_embedding", None)
+        gpu_ids = (
+            os.environ.get("EXL3_MTP_GPU_IDS", "0") == "1"
+            and self.draft_calibrator is None
+            and hot_embedding is not None
+            and hot_embedding.is_cuda
+        )
+
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
@@ -838,6 +859,7 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        draft_ids_gpu = [] if gpu_ids else None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -845,6 +867,7 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
+                "mtp_hot_embedding": bool(gpu_ids and idx > 0),
             }
             if cal is not None:
                 params["export_draft_conf"] = True
@@ -852,8 +875,14 @@ class Generator:
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            if gpu_ids:
+                # `new_ids` is already produced by argmax on the MTP device. Passing it back
+                # to the next MTP input avoids the per-position D2H/H2D dependency chain.
+                draft_ids_gpu.append(new_ids)
+                batch_ids = new_ids
+            else:
+                self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+                batch_ids.copy_(new_ids)
             cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
@@ -865,6 +894,13 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
+
+        if gpu_ids:
+            # Target verification still consumes its established CPU staging tensor. One
+            # contiguous copy preserves proposal order and gives exactly the baseline IDs.
+            self.draft_ids_pinned[:batch_size, :window].copy_(
+                torch.cat(draft_ids_gpu, dim = -1)
+            )
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -1305,6 +1341,11 @@ class Generator:
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
+                if draft_tokens is not None and self.record_draft_ids:
+                    ids = draft_tokens[j].reshape(-1).tolist()
+                    if not hasattr(job, "draft_proposal_ids"):
+                        job.draft_proposal_ids = []
+                    job.draft_proposal_ids.extend(int(token_id) for token_id in ids)
                 accepted_length = 1
                 rejected = 0
 

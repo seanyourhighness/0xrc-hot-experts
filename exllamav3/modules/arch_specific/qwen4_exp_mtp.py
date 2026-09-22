@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+import torch.nn.functional as F
 from ...util.device_copy import to_device
 from ...model.config import Config
 from ...modules import Module, Linear, RMSNorm
@@ -80,6 +81,8 @@ class Qwen4ExpMTPInputLayer(Module):
 
         # Populated by attach_to()
         self.attached_model = None
+        self.hot_embedding = None
+        self.hot_inverse = None
 
         self.caps.update({"x_cpu": True})
 
@@ -150,8 +153,14 @@ class Qwen4ExpMTPInputLayer(Module):
             * self.norm_hidden_w
         h = self.fc_hidden.forward(normed.half().contiguous(), params)         # (b, s, H, D)
 
-        # Token embedding via the attached model
-        emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
+        if params.get("mtp_hot_embedding") and self.hot_embedding is not None:
+            hot_ids = self.hot_inverse[x]
+            if (hot_ids < 0).any():
+                raise RuntimeError("MTP hot embedding received a token outside its selected vocabulary")
+            emb = F.embedding(hot_ids, self.hot_embedding).half()
+        else:
+            # Token embedding via the attached model
+            emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
         emb = self.pre_fc_norm_embedding.forward(to_device(emb, self.device), params)
         emb = self.fc_embedding.forward(emb, params)                           # (b, s, D)
 
