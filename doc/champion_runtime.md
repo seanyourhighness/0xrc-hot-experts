@@ -15,7 +15,7 @@ This is a release candidate until the clean RTX 4070 Ti / 48 GB qualification re
 Linux or WSL2, a working NVIDIA driver, AVX2, Git, and `uv` are required. The model must already be an EXL3 checkpoint on a fast local filesystem.
 
 ```bash
-git clone https://github.com/r0b0tlab/exllamav3.git
+git clone https://github.com/seanyourhighness/exllamav3.git
 cd exllamav3
 git checkout release/champion-runtime-v0.1
 
