@@ -123,6 +123,10 @@ class MoeCpuTuning:
         # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
         # on the GPU side
         self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+        # Streamed-prefill deterministic reduction: GPU expert outputs land in per-assignment
+        # fp32 slots and a fixed-order gather reduces them after the streamed batches. Disabled
+        # by default so the existing atomic streamed path remains the control.
+        self.stream_det = os.environ.get("EXL3_MOE_STREAM_DET", "0") != "0"
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
@@ -235,14 +239,28 @@ class _HugeArena:
             return
         collapse = getattr(mmap, "MADV_COLLAPSE", 25)
         t0 = time.perf_counter()
-        for c in self.chunks:
+        errors = []
+        debug = bool(os.environ.get("EXL3_MOE_ARENA_DEBUG"))
+        for i, c in enumerate(self.chunks):
             try:
                 c.madvise(collapse)
-            except Exception:
-                pass
-        if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+                if debug:
+                    print(f" -- arena: MADV_COLLAPSE chunk {i} complete "
+                          f"at {time.perf_counter() - t0:.1f} s", flush = True)
+            except OSError as e:
+                errors.append(f"{i}:{e.errno}:{e.strerror}")
+                if debug:
+                    print(f" -- arena: MADV_COLLAPSE chunk {i} failed "
+                          f"{e.errno}:{e.strerror}", flush = True)
+            except Exception as e:
+                errors.append(f"{i}:{type(e).__name__}")
+                if debug:
+                    print(f" -- arena: MADV_COLLAPSE chunk {i} failed "
+                          f"{type(e).__name__}", flush = True)
+        if debug:
             print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks "
-                  f"in {time.perf_counter() - t0:.1f} s", flush = True)
+                  f"in {time.perf_counter() - t0:.1f} s"
+                  + (f"; failures {', '.join(errors)}" if errors else ""), flush = True)
 
     def rehome(self, tensor, band_swizzle = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
@@ -512,6 +530,43 @@ class MoeCpuHost:
         self.arena_views = []
         self.layer_blocks = []
         self.batch_recon = TUNING.stream_batch_recon
+        self.stream_det = TUNING.stream_det
+        # Profiling-only GPU-stream brackets for the fused decode handoff. Disabled by
+        # default, so the production handoff retains exactly its existing launches/order.
+        self.gprof_enabled = os.environ.get("EXL3_MOE_GPU_HANDOFF_PROF") is not None
+        self.gprof = {}
+
+    def _gprof_call(self, kind, layer, fn):
+        """Record a CUDA-stream interval for a fused handoff sub-step when requested."""
+        if not self.gprof_enabled:
+            return fn()
+        ev0 = torch.cuda.Event(enable_timing = True)
+        ev1 = torch.cuda.Event(enable_timing = True)
+        ev0.record()
+        result = fn()
+        ev1.record()
+        recs = self.gprof.setdefault(kind, [])
+        recs.append((layer, ev0, ev1))
+        if kind != "collect_consumed" or len(recs) < 2048:
+            return result
+        for label, samples in self.gprof.items():
+            timings = [(layer_idx, start.elapsed_time(stop))
+                       for layer_idx, start, stop in samples if stop.query()]
+            if not timings:
+                continue
+            values = sorted(value for _, value in timings)
+            per_layer = {}
+            for layer_idx, value in timings:
+                total, count = per_layer.get(layer_idx, (0.0, 0))
+                per_layer[layer_idx] = (total + value, count + 1)
+            worst = sorted(per_layer.items(), key=lambda item: -item[1][0] / item[1][1])[:4]
+            print(f" -- gpu handoff prof [{label}] ({len(values)} brackets, stream ms): "
+                  f"med {values[len(values) // 2]:.3f} p90 {values[int(len(values) * 0.9)]:.3f} "
+                  f"max {values[-1]:.3f} | worst layers "
+                  + " ".join(f"L{idx}:{total / count:.3f}"
+                             for idx, (total, count) in worst), flush=True)
+        self.gprof = {}
+        return result
 
     def _spawn(self):
         if self.proc is not None:
@@ -908,28 +963,33 @@ class MoeCpuHost:
             self.v_jobs_tail[0] = tail + 1
 
             if self.slot_last_seq[slot_idx]:
-                ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx],
-                                       self.gpu_base_ptr + 128)
-            ext.moe_split_issue(
+                self._gprof_call("issue_slot_reuse", layer_idx, lambda:
+                    ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx],
+                                           self.gpu_base_ptr + 128))
+            self._gprof_call("issue_stage", layer_idx, lambda: ext.moe_split_issue(
                 selected_experts.view(-1), split_map, split_hist,
                 y, routing_weights,
                 slot["sel_dev"], slot["x_dev"], slot["w_dev"],
                 counts, slot_idx, hi, first_cpu,
-            )
-            ext.exl3_moe_flag_write(slot["data_ready"], seq)
+            ))
+            self._gprof_call("issue_publish", layer_idx,
+                             lambda: ext.exl3_moe_flag_write(slot["data_ready"], seq))
             self.slot_last_seq[slot_idx] = seq
-        return (seq, slot_idx, rows, h_, spec["ho"], dev, counts)
+        return (seq, slot_idx, rows, h_, spec["ho"], dev, counts, layer_idx)
 
     def submit_collect_fused(self, handle, final_2d):
         """Fold the worker's partial into final_2d (rows, h) in place, straight from the
         pinned slot, or, for a job the issue kernel recorded as empty, do nothing (no
         PCIe reads). Never synchronizes the host."""
-        seq, slot_idx, rows, h_, ho, dev, counts = handle
+        seq, slot_idx, rows, h_, ho, dev, counts, layer_idx = handle
         slot = self.slots[slot_idx]
         with torch.cuda.device(dev):
-            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
-            ext.moe_split_collect_add(final_2d, slot["out_dev"], counts, slot_idx, ho)
-            ext.exl3_moe_flag_write(slot["consumed"], seq)
+            self._gprof_call("collect_cpu_wait", layer_idx, lambda:
+                ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128))
+            self._gprof_call("collect_add", layer_idx, lambda:
+                ext.moe_split_collect_add(final_2d, slot["out_dev"], counts, slot_idx, ho))
+            self._gprof_call("collect_consumed", layer_idx, lambda:
+                ext.exl3_moe_flag_write(slot["consumed"], seq))
 
     def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec, out, h):
         """
@@ -1348,6 +1408,55 @@ class MoeCpuHost:
         if fused_t and any(counts_h[e] <= fused_t for e in streamed):
             fbufs = self._stream_fused_bufs(st, spec, y.device)
 
+        # Optional deterministic streamed reduction. The normal GPU prefill path already
+        # supplies the exl3_moe scratch/table arguments and gathers assignments in fixed k
+        # order. The streamed CPU-offload path historically passed None/None, leaving its
+        # fused GPU assignments on atomic accumulation. Pre-plan the same slot ownership here
+        # so each streamed batch can write disjoint rows and one gather can combine them after
+        # all batches. The per-expert fallback remains in `out` and is sequenced before gather.
+        stream_scratch = None
+        stream_slot_base = None
+        stream_slot_kind = None
+        stream_expert_start = None
+        stream_inv_order = None
+        stream_slot_base_h = None
+        stream_group_slots = {}
+        if self.stream_det and (fused_t or recon is not None):
+            stream_slot_base_h = [0] * E
+            stream_slot_kind_h = [0] * E
+            n_stream_slots = 0
+            for i0 in range(0, len(streamed), per_slot):
+                batch = streamed[i0:i0 + per_slot]
+                fused_batch = [e for e in batch if fused_t and counts_h[e] <= fused_t]
+                for e in fused_batch:
+                    stream_slot_base_h[e] = n_stream_slots
+                    stream_slot_kind_h[e] = 1  # fused kernel writes weighted output
+                    n_stream_slots += counts_h[e]
+
+                heavy_batch = [e for e in batch if e not in fused_batch]
+                if recon is not None:
+                    grouped = [e for e in heavy_batch if counts_h[e] <= recon.max_rows]
+                    for grp in plan_groups(grouped, lambda e: counts_h[e], recon.cap):
+                        cmax = max(counts_h[e] for e in grp)
+                        group_base = n_stream_slots
+                        stream_group_slots[tuple(grp)] = (group_base, cmax)
+                        for b, e in enumerate(grp):
+                            stream_slot_base_h[e] = group_base + b * cmax
+                            stream_slot_kind_h[e] = 2  # reconstruct writes unweighted output
+                        n_stream_slots += len(grp) * cmax
+
+            if n_stream_slots:
+                stream_scratch = torch.empty(
+                    (n_stream_slots, h), dtype = torch.float, device = y.device)
+                stream_slot_base = torch.tensor(
+                    stream_slot_base_h, dtype = torch.long, device = y.device)
+                stream_slot_kind = torch.tensor(
+                    stream_slot_kind_h, dtype = torch.long, device = y.device)
+                stream_expert_start = torch.tensor(
+                    offs[:E], dtype = torch.long, device = y.device)
+                stream_inv_order = torch.empty_like(order).scatter_(
+                    0, order, torch.arange(order.numel(), device = order.device))
+
         for i0 in range(0, len(streamed), per_slot):
             batch = streamed[i0:i0 + per_slot]
             ws = self.next_wslot
@@ -1418,6 +1527,11 @@ class MoeCpuHost:
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]
+            batch_slot_base = None
+            if stream_scratch is not None:
+                batch_slot_base = torch.tensor(
+                    [stream_slot_base_h[e] for e in batch] + [0],
+                    dtype = torch.long, device = y.device)
 
             # Mid tier: one fused kernel over the batch's cooler experts. Heavy experts stay in
             # the descriptor (the kernel skips counts above the temp-row capacity) so the
@@ -1469,7 +1583,8 @@ class MoeCpuHost:
                         tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
                         tblt[6], tblt[7], tblt[8],
                         False, True, False, True, False, True,
-                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
+                        float(spec["act_limit"] or 0.0), n_act,
+                        stream_scratch, batch_slot_base, lo, hi, mt
                     )
 
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
@@ -1505,10 +1620,15 @@ class MoeCpuHost:
                 for grp in plan_groups([e for _, e in heavy], lambda e: counts_h[e], recon.cap):
                     # Trellis addresses inside the VRAM slot, per projection
                     bb = [base + slot_of[e] * exp_b for e in grp]
+                    out_slab = None
+                    if stream_scratch is not None:
+                        group_base, cmax = stream_group_slots[tuple(grp)]
+                        out_slab = stream_scratch[group_base : group_base + len(grp) * cmax]
                     recon.run_group(
                         y_ext, out_ext, tok_ext, w_ext,
                         grp, [offs[e] for e in grp], [counts_h[e] for e in grp],
-                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]))
+                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]),
+                        out_slab = out_slab)
                 heavy = []
             single_ids = {e for _, e in single} if recon is not None else None
             for bi, e, idx, wseg in per_e:
@@ -1544,6 +1664,14 @@ class MoeCpuHost:
                                      st["w_scratch"])
                 out.index_add_(0, idx, dy[:, :h].float() * we)
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
+
+        if stream_scratch is not None:
+            # Fixed-order reduction of the streamed fused and batched-reconstruct slots. This
+            # is intentionally after all copy-stream batches have been queued and before the CPU
+            # tail merge, preserving overlap while removing atomic arrival-order dependence.
+            ext.exl3_moe_gather(
+                out, stream_scratch, flat, stream_inv_order, stream_expert_start,
+                stream_slot_base, stream_slot_kind, weight_sorted)
 
         # Collect the CPU tail (by now usually complete) and merge
         if tail_jobs:
