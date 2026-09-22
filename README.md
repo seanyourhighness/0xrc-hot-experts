@@ -2,7 +2,7 @@
 
 **A correctness-gated, hardware-adaptive ExLlamaV3 fork for large MoE models that need GPU/CPU expert offload.**
 
-[Latest prerelease](https://github.com/seanyourhighness/exllamav3-champion-runtime/releases/latest) ·
+[Champion v0.1.0 RC3](https://github.com/seanyourhighness/exllamav3-champion-runtime/releases/tag/champion-v0.1.0-rc3) ·
 [Runtime guide](doc/champion_runtime.md) · [Published evidence](benchmarks/README.md) ·
 [Branch map](doc/champion_branches.md) · [Upstream ExLlamaV3](https://github.com/turboderp-org/exllamav3)
 
