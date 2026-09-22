@@ -502,14 +502,15 @@ class BlockSparseMLP_CPU:
         self._split_perm_inv = None
         self._split_forced_ids = None
         self._split_saved_lists = (self.gates, self.ups, self.downs)
-        # Dynamic placement (default; EXL3_MOE_CPU_SWAP=0 disables): both the GPU's E - k
+        # Dynamic placement (opt-in; Champion enables it only after profiling and qualification):
+        # both the GPU's E - k
         # slots and the worker's k slots hold a CHANGING set of experts; a per-layer
         # router->slot map applied right after routing decides placement. A swap re-reads
         # both experts from the checkpoint: the promoted one into the GPU slot tensors in
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-        swap_requested = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0"
+        swap_requested = os.environ.get("EXL3_MOE_CPU_SWAP", "0") != "0"
         seed_requested = os.environ.get("EXL3_MOE_CPU_SWAP_SEED", "0") == "1"
         if seed_requested and not stats_path:
             raise ValueError("EXL3_MOE_CPU_SWAP_SEED=1 requires EXL3_MOE_CPU_SPLIT_STATS")
@@ -570,7 +571,7 @@ class BlockSparseMLP_CPU:
             self._split_forced_ids = tuple(forced)
             # A forced layer is static by construction: the dynamic sweep promotes a hot
             # CPU-resident expert into a GPU slot, which would undo the quarantine
-            if os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0":
+            if os.environ.get("EXL3_MOE_CPU_SWAP", "0") != "0":
                 print(f" !! {self.key}: EXL3_MOE_CPU_SWAP forced to 0 (static) by EXL3_MOE_CPU_EXPERTS")
             self._split_dynamic = False
             if self.gated:

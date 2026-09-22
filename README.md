@@ -7,6 +7,9 @@
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
+> [!IMPORTANT]
+> This fork contains the **Champion Runtime release candidate** for correctness-gated MoE CPU splitting, hardware auto-tuning, workload-profiled expert placement, and opt-in adaptive hot experts. Start with the [Champion Runtime guide](doc/champion_runtime.md). Adaptive placement is disabled by default and is enabled only when it beats the static profile while passing deterministic qualification.
+
 - **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
 - **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
@@ -302,5 +305,4 @@ supporters (🐈❤️!) The following projects in particular deserve a special 
 <p align="center">
   <img src="doc/cat.png" width="40" alt="">
 </p>
-
 

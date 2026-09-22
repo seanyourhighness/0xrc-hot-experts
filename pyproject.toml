@@ -31,6 +31,9 @@ dependencies = [
     "triton-windows; platform_system == 'Windows'",
 ]
 
+[project.scripts]
+exllamav3-champion = "exllamav3.champion.cli:main"
+
 [project.optional-dependencies]
 eval = [
     "transformers>=4.50.0",
