@@ -10,6 +10,9 @@ The profile is specific to one hardware fingerprint, model fingerprint, runtime 
 
 This is a release candidate until the clean RTX 4070 Ti / 48 GB qualification receipt is published.
 
+The public branch topology and upstream-validation order are documented in
+[champion_branches.md](champion_branches.md).
+
 ## Clean install
 
 Linux or WSL2, a working NVIDIA driver, AVX2, Git, and `uv` are required. The model must already be an EXL3 checkpoint on a fast local filesystem.
