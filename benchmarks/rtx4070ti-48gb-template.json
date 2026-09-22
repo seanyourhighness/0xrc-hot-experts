@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "evidence_level": "pending",
+  "status": "not-yet-qualified",
+  "system": {
+    "gpu": "NVIDIA GeForce RTX 4070 Ti 12 GB",
+    "cpu": null,
+    "memory": "48 GB",
+    "os": null
+  },
+  "release_tag": "champion-v0.1.0-rc3",
+  "model": {
+    "name": null,
+    "format": "EXL3",
+    "fingerprint": null
+  },
+  "qualification": {
+    "doctor_report_sha256": null,
+    "profile_sha256": null,
+    "verification_receipt_sha256": null,
+    "base_without_mtp_passed": null,
+    "selected_placement": null,
+    "adaptive_promoted": null,
+    "aggregate_decode_tok_per_s_repeats": [],
+    "aggregate_decode_tok_per_s_median": null,
+    "peak_vram_gb": null,
+    "minimum_available_host_ram_gb": null,
+    "all_outputs_full_length": null,
+    "fresh_process_hashes_match": null
+  },
+  "notes": [
+    "Template only. Null values and empty repeats are not benchmark claims.",
+    "Run the non-MTP qualification first; publish any later MTP pass as a separate record."
+  ]
+}

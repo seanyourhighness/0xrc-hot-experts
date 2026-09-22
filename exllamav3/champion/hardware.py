@@ -8,6 +8,7 @@ import platform
 import shutil
 import struct
 import subprocess
+import time
 from typing import Any
 
 from .schema import stable_sha256
@@ -177,7 +178,11 @@ def model_identity(model_dir: str | Path) -> dict[str, Any]:
             header = handle.read(header_length)
             if len(header) != header_length:
                 raise ValueError(f"truncated safetensors header: {path}")
-            content_sha256 = hash_cache.get(cache_key)
+            # Some filesystems expose timestamp granularity coarse enough for two same-size
+            # writes to share all stat fields. Never trust a cache entry while a shard is still
+            # inside that ambiguity window; stable model files regain the fast path after 2 s.
+            metadata_settled = max(stat.st_mtime_ns, stat.st_ctime_ns) < time.time_ns() - 2_000_000_000
+            content_sha256 = hash_cache.get(cache_key) if metadata_settled else None
             if content_sha256 is None:
                 content_hash = hashlib.sha256()
                 content_hash.update(length_bytes)

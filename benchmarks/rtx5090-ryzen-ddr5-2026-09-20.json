@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "evidence_level": "historical-champion",
+  "status": "qualified-on-recorded-protocol",
+  "date": "2026-09-20",
+  "system": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cpu": "AMD Ryzen 7 7800X3D",
+    "memory": "DDR5 host; WSL2 guest capped at approximately 40 GB",
+    "os": "WSL2"
+  },
+  "model": {
+    "name": "Qwen3.8 Flash-Next",
+    "format": "EXL3",
+    "bits_per_weight": 2.5
+  },
+  "runtime": {
+    "base_commit": "30846b89fc1d855c96b88f1caa6bd0ada15327b7",
+    "champion_patch_sha256": "67fada029fd41b145e08664de064360112bbf480a705feb3f267b911da185f7f"
+  },
+  "configuration": {
+    "moe_cpu_split": 288,
+    "moe_cpu_threads": 6,
+    "cache_quant": 3,
+    "cache_tokens": 270336,
+    "active_sequences": 1,
+    "placement": "profile-seeded-adaptive",
+    "adaptive_interval": 32,
+    "adaptive_max": 64,
+    "adaptive_hysteresis": 2.0,
+    "adaptive_floor": 8.0,
+    "mtp": true,
+    "num_draft_tokens": 3,
+    "mtp_moe_cpu_split": 0
+  },
+  "protocol": {
+    "prompt_count": 6,
+    "lanes": {"prose": 3, "code": 1, "reasoning": 2},
+    "warmup_tokens": 512,
+    "output_tokens_per_prompt": 128,
+    "temperature": 0.6,
+    "sampler": "categorical",
+    "seed": 123456,
+    "thinking": true,
+    "all_outputs_full_length": true,
+    "unexpected_short_stops": 0
+  },
+  "result": {
+    "aggregate_decode_tok_per_s": 64.04,
+    "lane_decode_tok_per_s": {"prose": 61.4, "code": 61.27, "reasoning": 70.17},
+    "ttft_prefill_seconds": 2.1455,
+    "load_seconds": 118.3,
+    "peak_vram_gb": 29.58,
+    "minimum_available_host_ram_gb": 8.76,
+    "mtp_accepted_tokens": 484,
+    "mtp_rejected_tokens": 368,
+    "fresh_run_band_tok_per_s": [63.6, 67.5],
+    "prior_paired_adaptive_mean_tok_per_s": 66.07,
+    "prior_paired_adaptive_gain_percent": 7.4
+  },
+  "notes": [
+    "This predates the packaged doctor/tune/verify wrapper and is retained as historical Champion evidence.",
+    "Static profile specialization was not released; the generic warm start plus adaptive SEED path won.",
+    "Host memory capacity is intentionally not inferred from the WSL2 guest limit."
+  ]
+}

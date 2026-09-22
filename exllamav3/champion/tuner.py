@@ -39,6 +39,14 @@ RUNTIME_SOURCE_PATHS = (
 )
 
 
+def _runtime_identity_digest(python: str, source_sha256: dict[str, str | None]) -> str:
+    """Hash executable runtime inputs while retaining Git state as provenance only."""
+    return stable_sha256({
+        "python": python,
+        "source_sha256": source_sha256,
+    })
+
+
 def runtime_identity() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[2]
     source_sha256 = {}
@@ -67,12 +75,9 @@ def runtime_identity() -> dict[str, Any]:
         "python": sys.version.split()[0],
         "source_sha256": source_sha256,
     }
-    identity["identity_sha256"] = stable_sha256({
-        "commit": identity["commit"],
-        "dirty_diff_sha256": identity["dirty_diff_sha256"],
-        "python": identity["python"],
-        "source_sha256": identity["source_sha256"],
-    })
+    identity["identity_sha256"] = _runtime_identity_digest(
+        identity["python"], identity["source_sha256"]
+    )
     return identity
 
 

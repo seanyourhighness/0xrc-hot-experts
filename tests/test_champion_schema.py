@@ -12,6 +12,7 @@ from exllamav3.champion.policy import (
 from exllamav3.champion.schema import ChampionConfig, ChampionProfile, TrialResult
 from exllamav3.champion.tuner import (
     _fresh_process_hashes_match,
+    _runtime_identity_digest,
     _trial_outputs_match_reference,
     run_worker,
 )
@@ -119,6 +120,16 @@ def test_runtime_env_allows_tuned_cpu_pinning_override():
         env = {"EXL3_MOE_CPU_PIN": "0"},
     )
     assert config.runtime_env()["EXL3_MOE_CPU_PIN"] == "0"
+
+
+def test_runtime_identity_digest_ignores_git_provenance():
+    source_hashes = {"exllamav3/champion/tuner.py": "abc"}
+    digest = _runtime_identity_digest("3.11.14", source_hashes)
+    assert digest == _runtime_identity_digest("3.11.14", source_hashes)
+    assert digest != _runtime_identity_digest("3.12.0", source_hashes)
+    assert digest != _runtime_identity_digest(
+        "3.11.14", {"exllamav3/champion/tuner.py": "changed"}
+    )
 
 
 def test_adaptive_outputs_must_match_static_baseline():

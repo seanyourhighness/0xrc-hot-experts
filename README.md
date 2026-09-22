@@ -1,308 +1,165 @@
+# ExLlamaV3 Champion Runtime
 
-<p align="center">
-  <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
-</p>
+**A correctness-gated, hardware-adaptive ExLlamaV3 fork for large MoE models that need GPU/CPU expert offload.**
 
-[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
-
-ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
+[Latest prerelease](https://github.com/seanyourhighness/exllamav3-champion-runtime/releases/latest) ·
+[Runtime guide](doc/champion_runtime.md) · [Published evidence](benchmarks/README.md) ·
+[Branch map](doc/champion_branches.md) · [Upstream ExLlamaV3](https://github.com/turboderp-org/exllamav3)
 
 > [!IMPORTANT]
-> This fork contains the **Champion Runtime release candidate** for correctness-gated MoE CPU splitting, hardware auto-tuning, workload-profiled expert placement, and opt-in adaptive hot experts. Start with the [Champion Runtime guide](doc/champion_runtime.md). Adaptive placement is disabled by default and is enabled only when it beats the static profile while passing deterministic qualification.
+> This is an independent experimental fork, not an official ExLlamaV3 release. It remains a
+> release candidate until a clean RTX 4070 Ti / 48 GB qualification is published. The Python
+> distribution and import name intentionally remain `exllamav3` for compatibility.
 
-- **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
-- **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
-- **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
-- **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
-- **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](examples/transformers_integration.py), and an OpenAI-compatible API via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/).
+Champion Runtime automates the process that produced our fastest safe configurations:
 
-> [!TIP]
-> **Looking for a server?** [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is the official and recommended backend server. It provides an OpenAI-compatible API for local or remote inference, HF model downloading, embedding model support, and HF Jinja2 chat templates. Its startup script manages and installs prerequisites to help you get started.
-
-<p align="center">
-  <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
-</p>
-
-## Installation
-
-Start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later) since the Torch dependency is not automatically handled by `pip`. Then pick a method below:
-
-### Prebuilt wheel · recommended
-
-Pick a wheel from the [releases page](https://github.com/turboderp-org/exllamav3/releases), then e.g.:
-
-```sh
-pip install https://github.com/turboderp-org/exllamav3/releases/download/v0.0.6/exllamav3-0.0.6+cu128.torch2.8.0-cp313-cp313-linux_x86_64.whl
+```text
+doctor → tune hardware → capture routing → compare static/adaptive → verify → serve
 ```
 
-### Install from PyPI
+It fingerprints the machine, checkpoint, workload, and executable runtime; searches CPU expert
+split, physical-core worker count, pinning, and optional MTP settings; learns which experts are hot;
+and enables adaptive expert swapping only when repeated fresh-process tests pass correctness,
+memory, and throughput gates.
 
-```sh
-pip install exllamav3
-```
-Note that the PyPI package does not contain a prebuilt extension and requires the CUDA toolkit and build prerequisites (i.e. VS Build Tools on Windows, gcc on Linux, `python-dev` headers etc.).
+## Why this fork exists
 
-### Build from source
+Large routed-MoE checkpoints can fit on consumer GPUs only by putting many experts in system RAM.
+The fastest split is specific to the GPU, CPU, RAM, NUMA topology, checkpoint, context, and workload.
+A configuration copied from another machine can be slower, run out of memory, or expose a
+correctness problem.
 
-<details>
-<summary>Source installation with uv or pip</summary>
+This fork adds four separable layers on top of upstream ExLlamaV3:
 
+- deterministic CPU-MoE reduction and CPU worker/K3 correctness fixes;
+- profile-based static hot-expert placement, which is the safe default;
+- opt-in, profile-seeded adaptive hot-expert swapping with checkpoint-ID-safe remapping;
+- an installable `exllamav3-champion` workflow that records every trial and fails closed.
 
-`exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment.
+The focused review branches and their tests are documented in
+[the branch map](doc/champion_branches.md). MTP work remains isolated so the base runtime can be
+qualified without speculative decoding.
 
-`torch` can be installed in three ways (from least to most effort):
-1. **with `uv`, setting only `--extra cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosen CUDA version (options 1 and 2)
-2. **with `uv`, creating a thin project that depends on `exllamav3[cuXXX]` and pins a specific `torch` version** — like (1) but `torch` is pinned in the thin project's `pyproject.toml`, see [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) for details
-3. Manually with `uv pip` or `pip` (options 3 and 4)
+## Should you use it?
 
-The flavor extras (`--extra`) are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your installed CUDA build. Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`.
+Use this fork if:
 
-**Option 1 — Working in the cloned repo directly (`uv sync`):**
+- you are running a large EXL3 routed-MoE checkpoint on an NVIDIA GPU with CPU expert offload;
+- you use Linux or WSL2 on an AVX2-capable CPU and can reserve time for machine-local tuning;
+- deterministic output checks, memory headroom, and retained benchmark receipts matter to you;
+- you want static profiled placement first and adaptive behavior only after measured promotion.
 
-```sh
-git clone https://github.com/turboderp-org/exllamav3
-cd exllamav3
-# (Optional) switch to dev branch for latest in-progress features
-git checkout dev
+Do not use it if:
 
-uv venv
-uv sync --extra cu130
-# add --extra examples and/or --extra eval for those extra dependencies
-```
+- you need an official upstream-supported or PyPI-stable ExLlamaV3 build;
+- you are using AMD, Apple Silicon, CPU-only inference, or hardware without AVX2;
+- your model is dense or already fits fully on the GPU—the MoE offload work may provide no benefit;
+- you want to copy someone else's profile instead of qualifying your own hardware and checkpoint;
+- you cannot tolerate release-candidate code in production.
 
-**Option 2 — Using `exllamav3` as a dependency from another project (`uv add`):**
+For normal ExLlamaV3 use, broad model documentation, conversion, and upstream releases, use
+[turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3).
 
-```sh
-# `uv add` works inside an existing project (a directory with a pyproject.toml).
-# `uv init` creates one if you're starting a new project, if integrating into
-# an existing project skip `uv init`.
-uv init my-project
-cd my-project
+## Current evidence
 
-# local checkout
-uv add 'path/to/exllamav3[cu130]'               # non-editable
-uv add 'path/to/exllamav3[cu130]' --editable    # editable
+These are controlled single-user measurements, not claims that every model or prompt will reach the
+same speed. The 5090 and 4090 rows used the same six-lane shape but different sampling settings, so
+they are evidence that the runtime works on two architectures—not a cross-machine leaderboard.
 
-# straight from GitHub
-uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'                 # default branch
-uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev    # specific branch
-```
+| System | Qualified mode | Configuration | Aggregate decode | Status |
+|---|---|---|---:|---|
+| RTX 5090 · Ryzen 7 7800X3D · DDR5 · WSL2 | profile-seeded adaptive + MTP3 | MCS288 / MCT6 / CQ3 | **64.04 tok/s** | Published historical Champion evidence |
+| RTX 4090 · HP Z840 · Broadwell AVX2 · DDR4 ECC | static profile + MTP3 | MCS336 / MCT16 pinned / CQ3 | **26.53 tok/s** mean | Published historical Champion evidence |
+| RTX 4070 Ti · 48 GB system RAM | pending | generated by tuner | — | Clean-install release gate |
 
-**Option 3 — Bring your own `torch` and let `uv` pick the backend automatically:**
+The 5090 release row completed all six 128-token requests, reached 29.58 GB peak VRAM, and matched
+the established 63.6–67.5 tok/s fresh-run band. The 4090 winner repeated at 25.73, 26.81, and
+27.05 tok/s; its static configuration stayed selected because adaptive swapping was not qualified
+on that host. Full protocols, caveats, provenance, and machine-readable records are in
+[benchmarks/](benchmarks/README.md).
 
-```sh
-uv venv            # or: uv venv --python-preference only-managed
+## Install the release candidate
+
+Requirements: Linux or WSL2, NVIDIA driver, AVX2, Git, `uv`, and an EXL3 checkpoint on a fast local
+filesystem. PyTorch must be installed before the extension is built.
+
+```bash
+git clone https://github.com/seanyourhighness/exllamav3-champion-runtime.git
+cd exllamav3-champion-runtime
+git checkout champion-v0.1.0-rc3
+
+uv venv --python 3.11
 source .venv/bin/activate
-uv pip install torch --torch-backend=auto
-uv pip install .
+uv pip install torch setuptools wheel ninja --torch-backend=auto
+MAX_JOBS=4 uv pip install --no-build-isolation -e .
+
+exllamav3-champion --help
 ```
 
-`--torch-backend=auto` inspects your system and installs the matching PyTorch CUDA build; see [Automatic backend selection](https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection).
+Use the immutable tag for a result you intend to publish. The moving
+`release/champion-runtime-v0.1` branch is for evaluating the next candidate. Release assets and
+checksums are on the [GitHub releases page](https://github.com/seanyourhighness/exllamav3-champion-runtime/releases).
 
-**Option 4 — With `pip`:**
+## Profile and qualify your machine
 
-On Windows, you also need the `triton-windows` package (declared as a dependency in `pyproject.toml`); the attention, cache and recurrent kernels are Triton and ExLlamaV3 does not import without it.
+Start without MTP so CPU offload and expert placement are isolated:
 
-```sh
-# install a CUDA-enabled torch first so it matches your setup, e.g.:
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install .
+```bash
+export CHAMPION_MODEL=/absolute/path/to/exl3-model
+export CHAMPION_RUN="$PWD/champion-runs/my-machine"
+
+exllamav3-champion doctor \
+  --model "$CHAMPION_MODEL" \
+  --json-out "$CHAMPION_RUN/doctor.json"
+
+exllamav3-champion tune \
+  --model "$CHAMPION_MODEL" \
+  --output "$CHAMPION_RUN" \
+  --context 8192 \
+  --cache-quant 3 \
+  --min-vram-headroom 1.5 \
+  --min-host-available 8 \
+  --min-adaptive-gain 5 \
+  --no-mtp \
+  --resume
+
+export CHAMPION_PROFILE="$CHAMPION_RUN/champion-profile.json"
+exllamav3-champion profile-check "$CHAMPION_PROFILE"
+exllamav3-champion verify "$CHAMPION_PROFILE"
+exllamav3-champion serve "$CHAMPION_PROFILE" --print-env
 ```
 
-</details>
+`--resume` reuses only trials whose sealed inputs still match. The first model fingerprint streams
+all safetensors shards; later runs use a metadata-validated hash cache. A full tune launches many
+fresh model processes and can take substantial time.
 
-<details>
-<summary>Pinning a specific PyTorch version (optional)</summary>
+For production use, pass representative JSON/JSONL prompts with `--prompts`. See the
+[runtime guide](doc/champion_runtime.md) for the schema, retained artifacts, optional MTP pass, and
+backend launch placeholders.
 
-#### Pinning a specific PyTorch version (optional)
+## What “adaptive” means here
 
-The flavor extra picks the *index*, but by default torch resolves to the latest version on that
-index that satisfies `>=2.6.0`. To pin a specific torch version while developing on `exllamav3`,
-create a **"thin" project** that consumes your local checkout as an editable install and declares
-the exact `torch` version itself. This keeps the pin out of the `exllamav3` pyproject, so
-you can change the torch version freely without touching the repo.
+Adaptive swapping is not enabled merely because it exists. The tuner first captures routing and
+builds a static hot-to-cold expert placement. It then alternates three fresh static and three fresh
+adaptive processes. Adaptive is promoted only if it:
 
-```
-my-exllamav3-dev/          # thin project (uv init)
-├── pyproject.toml
-└── src/                  # package sources (auto-generated)
-```
+- completes all measured output lengths with matching output hashes;
+- matches the static correctness reference;
+- keeps the configured VRAM and host-RAM headroom;
+- has at least three passing fresh-process repeats per arm; and
+- improves median decode throughput by at least 5% by default.
 
-In `pyproject.toml`:
+If any gate fails, the sealed result uses static profile placement. That is a successful safe
+outcome, not an error. `serve` also refuses an unverified profile or a mismatched hardware, model,
+runtime, workload, or verification receipt unless an explicit diagnostic override is used.
 
-```toml
-[project]
-name = "my-exllamav3-dev"
-version = "0.1.0"
-description = "Dev environment for exllamav3"
-requires-python = ">=3.10.11"
-dependencies = [
-    "exllamav3[cu130]",   # select correct CUDA version
-    "torch==2.13.0",      # pin the exact torch version you need
-]
+## Contributing and upstreaming
 
-[tool.uv.sources]
-exllamav3 = { path = "../exllamav3", editable = true }
-```
+The release branch is the integrated user experience. Focused branches keep the correctness,
+profile-placement, adaptive, and MTP changes independently reviewable and testable. Please include
+the doctor report, sealed profile/receipt, prompt protocol, and exact release tag with performance
+reports. Do not publish copied profiles as portable recommendations.
 
-Adjust `../exllamav3` to point at your local checkout, then a plain `uv sync` sets up an
-environment with the correct PyTorch index (routed via the `cuXXX` extra),
-the pinned version of `torch` from that index (as long as it exists), and an editable install of `exllamav3` so code
-changes apply immediately. Switch CUDA flavors by changing the extra (`exllamav3[cu124]`,
-`exllamav3[cu128]`, …) and/or the torch pin in the thin project.
-
-Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above),
-specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
-
-</details>
-
-After installing with one of the options above, you should be able to run the conversion, eval and 
-example scripts from the main repo directory, e.g., `uv run python convert.py -i ...` or, for manual
-installations once the venv is active, `python convert.py -i ...`
-
-**Build environment variables**
-
-- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for 
-compilation. Set this to a reasonable value like 4 in that case.
-- `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch
-will build/load it at runtime instead.
-
-## Examples
-
-A number of example scripts are provided to showcase the features of the backend and generator. 
-For instance, a versatile CLI chatbot:
-
-<p align="center">
-  <img src="doc/chatpy.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
-</p>
-
-```sh
-python examples/chat.py -m <input_dir> -mode <prompt_mode>
-
-# Wealth of options
-python examples/chat.py -h
-```
-
-## Architecture support
-
-| Model family                                     | HF architecture | Multimodal | Notes |
-|--------------------------------------------------| --- | :---: | --- |
-| **AFM**                                          | `ArceeForCausalLM` |  |  |
-| **AfMoE**                                        | `AfmoeForCausalLM` |  |  |
-| **Apertus**                                      | `ApertursForCausalLM` |  |  |
-| **Command-R** etc.                               | `CohereForCausalLM` |  |  |
-| **Command-A**, **Command-R+** etc.               | `Cohere2ForCausalLM` |  |  |
-| **DeciLM**, **Nemotron**                         | `DeciLMForCausalLM` |  |  |
-| **Deepseek V3**                                  | `DeepseekV3ForCausalLM` |  |  |
-| **Deepseek V4**                                  | `DeepseekV4ForCausalLM` | ✓ |  |
-| **dots.llm1**                                    | `Dots1ForCausalLM` |  | |
-| **ERNIE 4.5**                                    | `Ernie4_5_ForCausalLM`<br>`Ernie4_5_MoeForCausalLM` |  |  |
-| **EXAONE 4.0**                                   | `Exaone4ForCausalLM` |  |  |
-| **Gemma 2**                                      | `Gemma2ForCausalLM` |  |  |
-| **Gemma 3**                                      | `Gemma3ForCausalLM`<br>`Gemma3ForConditionalGeneration` | ✓ |  |
-| **Gemma 4**                                      | `Gemma4ForConditionalGeneration`<br>`Gemma4UnifiedForConditionalGeneration` | ✓ | E2B/E4B unsupported |
-| **GLM 4**, **GLM 4.6**, etc.                     | `Glm4ForCausalLM`<br>`Glm4MoeForCausalLM` |  |  |
-| **GLM 4.1V**, **GLM 4.5V**                       | `Glm4vForConditionalGeneration`<br>`Glm4vMoeForConditionalGeneration` | ✓ |  |
-| **GLM 4.7 Flash**                                | `Glm4MoeLiteForCausalLM` |  |  |
-| **GLM 5.2**                                      | `GlmMoeDsaForCausalLM` |  |  |
-| **GLM 5.3-Flash**                                | `Glm5NextForConditionalGeneration` | ✓ |  |
-| **GPT-OSS**                                      | `GptOssForCausalLM` |  |  |
-| **HyperCLOVAX**                                  | `HyperCLOVAXForCausalLM`<br>`HCXVisionV2ForCausalLM` | ✓ |  |
-| **Hy3**                                          | `HYV3ForCausalLM` |  |  |
-| **IQuest-Coder**                                 | `IQuestCoderForCausalLM` |  |  |
-| **Laguna 2.1**                                   | `LagunaForCausalLM` |  |  |
-| **LFM 2.5**                                      | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM` |  |  |
-| **Llama 1/2/3**,**3.1-Nemotron** etc.            | `LlamaForCausalLM` |  |  |
-| **MiMo-RL**                                      | `MiMoForCausalLM` |  |  |
-| **MiniMax-M2**                                   | `MiniMaxM2ForCausalLM` |  |  |
-| **Mistral**, **Ministral 3**, **Mistral-4** etc. | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration` | ✓ |  |
-| **Mixtral**                                      | `MixtralForCausalLM` |  |  |
-| **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM` |  |  |
-| **Olmo 3.1**                                     | `Olmo3ForCausalLM` |  |  |
-| **Olmo-Hybrid**                                  | `OlmoHybridForCausalLM` |  |  |
-| **Phi3**, **Phi4**                               | `Phi3ForCausalLM` |  |  |
-| **Qwen 2**, **Qwen 2.5**, **Qwen 2.5 VL**        | `Qwen2ForCausalLM`<br>`Qwen2_5_VLForConditionalGeneration` | ✓ |  |
-| **Qwen 3**                                       | `Qwen3ForCausalLM`<br>`Qwen3MoeForCausalLM` |  |  |
-| **Qwen 3-Next**                                  | `Qwen3NextForCausalLM` |  |  |
-| **Qwen 3-VL**                                    | `Qwen3VLForConditionalGeneration` | ✓ |  |
-| **Qwen 3-VL MoE**                                | `Qwen3VLMoeForConditionalGeneration` | ✓ |  |
-| **Qwen 3.5**                                     | `Qwen3_5ForConditionalGeneration` | ✓ |  |
-| **Qwen 3.5 MoE**                                 | `Qwen3_5MoeForConditionalGeneration` | ✓ |  |
-| **Qwen 3.8-Flash-Next**                          | `Qwen4ExpForConditionalGeneration` | ✓ |  |
-| **Seed-OSS**                                     | `SeedOssForCausalLM` |  |  |
-| **SmolLM**                                       | `SmolLM3ForCausalLM` |  |  |
-| **SolarOpen**                                    | `SolarOpenForCausalLM` |  |  |
-| **Step 3.5 Flash**                               | `Step3p5ForCausalLM` |  |  |
-| **Step 3.7 Flash**                               | `Step3p7ForConditionalGeneration` | ✓ |  |
-
-Always adding more, stay tuned.
-
-## Conversion
-
-To convert a model to EXL3 format, use:
-
-```sh
-# Convert model
-python convert.py -i <input_dir> -o <output_dir> -w <working_dir> -b <bitrate>
-
-# Resume an interrupted quant job
-python convert.py -w <working_dir> -r
-
-# More options
-python convert.py -h
-```
-
-The working directory is temporary storage for state checkpoints and for storing quantized tensors 
-until the converted model can be compiled. It should have enough free space to store an entire copy 
-of the output model.
-
-See the [conversion guide](doc/convert.md) for more information, or the 
-[self-calibration guide](doc/optimize.md). 
-
-## EXL3 quantization
-
-EXL3 quantization is a streamlined variant of [**QTIP**](https://github.com/Cornell-RelaxML/qtip) from Cornell RelaxML. It aims to make
-SOTA quantization available to users on consumer hardware. The conversion process is designed to be
-simple and efficient and requires only an input model (in HF format) and a target bitrate. By
-computing Hessians on the fly and thanks to a fused Viterbi kernel, the quantizer can convert a 
-model in a single step, taking a couple of minutes for smaller models, up to a few hours for larger
-ones (70B+) on a single high-end consumer GPU (see the [conversion guide](doc/convert.md)).
-
-For more information, see the [**QTIP**](https://arxiv.org/abs/2406.11235) and [**QuIP#**](https://arxiv.org/abs/2402.04396) papers, as well as this 
-[excellent writeup](https://www.together.ai/blog/even-better-even-faster-quantized-llms-with-qtip) on **QTIP** from together.ai.
-
-
-## Community
-
-You are always welcome to join the [ExLlama discord server](https://discord.gg/NSFwVuCjRq) ←🎮
-
-
-### 🤗 Models on Hugging Face
-
-Browse the [EXL3 model collection](https://huggingface.co/collections/turboderp/exl3-models-67f2dfe530f05cb9f596d21a) for quantized models. Also shout out to the following lovely
-people:
-
-- [ArtusDev](https://huggingface.co/ArtusDev)
-- [MikeRoz](https://huggingface.co/MikeRoz)
-- [MetaphoricalCode](https://huggingface.co/MetaphoricalCode)
-- [Ready.Art](https://huggingface.co/ReadyArt)
-- [isogen](https://huggingface.co/isogen/models)
-
-
-## Acknowledgements
-
-This project owes its existence to a wonderful community of FOSS developers and some very generous
-supporters (🐈❤️!) The following projects in particular deserve a special mention:
-
-- [TabbyAPI](https://github.com/theroyallab/tabbyAPI/)
-- [PyTorch](https://github.com/pytorch/pytorch)
-- [FlashAttention](https://github.com/Dao-AILab/flash-attention)
-- [QTIP](https://github.com/Cornell-RelaxML/qtip)
-- [Transformers](https://github.com/huggingface/transformers)
-- [Marlin](https://github.com/IST-DASLab/marlin)
-- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) (chunked linear-attention prefill kernels, vendored under `exllamav3/vendor/fla`)
-
-<p align="center">
-  <img src="doc/cat.png" width="40" alt="">
-</p>
-
+ExLlamaV3 is created and maintained upstream by
+[turboderp and contributors](https://github.com/turboderp-org/exllamav3). This fork preserves the
+upstream MIT license; see [LICENSE](LICENSE).

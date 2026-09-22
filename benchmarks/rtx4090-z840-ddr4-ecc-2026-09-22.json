@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "evidence_level": "historical-champion",
+  "status": "qualified-on-recorded-protocol",
+  "date": "2026-09-22",
+  "system": {
+    "gpu": "NVIDIA GeForce RTX 4090 24 GB",
+    "platform": "HP Z840",
+    "cpu": "Broadwell-class AVX2, 16 physical cores / 32 logical CPUs",
+    "memory": "78 GiB DDR4 ECC",
+    "pcie": "PCIe 3.0 x16",
+    "os": "native Linux"
+  },
+  "model": {
+    "name": "Qwen3.8 Flash-Next",
+    "format": "EXL3",
+    "bits_per_weight": 2.5
+  },
+  "runtime": {
+    "base_commit": "30846b89fc1d855c96b88f1caa6bd0ada15327b7",
+    "champion_patch_sha256": "67fada029fd41b145e08664de064360112bbf480a705feb3f267b911da185f7f"
+  },
+  "configuration": {
+    "moe_cpu_split": 336,
+    "moe_cpu_threads": 16,
+    "cpu_workers_pinned": true,
+    "cache_quant": 3,
+    "cache_tokens": 270336,
+    "active_sequences": 1,
+    "placement": "static-profile",
+    "mtp": true,
+    "num_draft_tokens": 3,
+    "ngram_k": 5,
+    "ngram_storage": "NVMe-streamed"
+  },
+  "protocol": {
+    "prompt_count": 6,
+    "output_tokens_per_prompt": 128,
+    "batch_size": 1,
+    "temperature": 0.0,
+    "seed": 123456,
+    "fresh_process_repeats": 3,
+    "correctness_gate_passed": true
+  },
+  "result": {
+    "aggregate_decode_tok_per_s_repeats": [25.73, 26.81, 27.05],
+    "aggregate_decode_tok_per_s_mean": 26.53,
+    "representative_peak_vram_gib": 24.45,
+    "representative_minimum_available_host_ram_gib": 51.35,
+    "representative_mtp_accepted_tokens": 499,
+    "representative_mtp_rejected_tokens": 308,
+    "control_mcs352_mct16_repeats": [23.11, 23.47, 23.59],
+    "control_mcs352_mct16_mean_tok_per_s": 23.39,
+    "mcs352_mct12_unpinned_tok_per_s": 18.92,
+    "mcs352_mct12_pinned_tok_per_s": 20.72,
+    "pinning_gain_percent": 9.5,
+    "mcs352_mct20_pinned_tok_per_s": 19.77
+  },
+  "notes": [
+    "This predates the packaged doctor/tune/verify wrapper and is retained as historical Champion evidence.",
+    "Adaptive swapping remained disabled because the dynamic path had not passed the host's warmed correctness gate.",
+    "Sixteen physical-core workers beat 20 workers; SMT siblings reduced throughput.",
+    "NUMA binding, RAM-resident n-gram storage, and alternate memory experiments did not beat the selected control."
+  ]
+}

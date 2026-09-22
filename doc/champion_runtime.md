@@ -18,9 +18,9 @@ The public branch topology and upstream-validation order are documented in
 Linux or WSL2, a working NVIDIA driver, AVX2, Git, and `uv` are required. The model must already be an EXL3 checkpoint on a fast local filesystem.
 
 ```bash
-git clone https://github.com/seanyourhighness/exllamav3.git
-cd exllamav3
-git checkout release/champion-runtime-v0.1
+git clone https://github.com/seanyourhighness/exllamav3-champion-runtime.git
+cd exllamav3-champion-runtime
+git checkout champion-v0.1.0-rc3
 
 uv venv --python 3.11
 source .venv/bin/activate
@@ -28,7 +28,8 @@ uv pip install torch setuptools wheel ninja --torch-backend=auto
 MAX_JOBS=4 uv pip install --no-build-isolation -e .
 ```
 
-The source branch is intentionally pinned. Once a release-candidate tag exists, prefer the immutable tag over the branch.
+The release-candidate tag is immutable. Use `release/champion-runtime-v0.1` only when intentionally
+testing work newer than the published candidate.
 
 ## RTX 4070 Ti / 48 GB qualification
 
