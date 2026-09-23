@@ -20,7 +20,7 @@ Linux or WSL2, a working NVIDIA driver, AVX2, Git, and `uv` are required. The mo
 ```bash
 git clone https://github.com/seanyourhighness/exllamav3-champion-runtime.git
 cd exllamav3-champion-runtime
-git checkout champion-v0.1.0-rc3
+git checkout champion-v0.1.0-rc4
 
 uv venv --python 3.11
 source .venv/bin/activate
