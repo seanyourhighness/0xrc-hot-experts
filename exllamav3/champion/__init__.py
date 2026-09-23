@@ -1,4 +1,4 @@
-"""Reproducible hardware qualification for the Champion runtime."""
+"""Reproducible hardware qualification for the 0xrc hot-expert runtime."""
 
 from .schema import ChampionConfig, ChampionProfile, TrialResult
 

@@ -1,6 +1,6 @@
-# Champion Runtime release candidate
+# 0xrc Runtime
 
-Champion Runtime turns the experimental EXL3 MoE CPU path into a fail-closed workflow:
+0xrc turns the experimental EXL3 MoE CPU path into a fail-closed workflow:
 
 ```text
 doctor -> tune static hardware -> capture expert routing -> qualify static vs adaptive -> verify -> serve
@@ -11,16 +11,16 @@ The profile is specific to one hardware fingerprint, model fingerprint, runtime 
 This is a release candidate until the clean RTX 4070 Ti / 48 GB qualification receipt is published.
 
 The public branch topology and upstream-validation order are documented in
-[champion_branches.md](champion_branches.md).
+[0xrc_branches.md](0xrc_branches.md).
 
 ## Clean install
 
 Linux or WSL2, a working NVIDIA driver, AVX2, Git, and `uv` are required. The model must already be an EXL3 checkpoint on a fast local filesystem.
 
 ```bash
-git clone https://github.com/seanyourhighness/exllamav3-champion-runtime.git
-cd exllamav3-champion-runtime
-git checkout champion-v0.1.0-rc4
+git clone https://github.com/seanyourhighness/0xrc-hot-experts.git
+cd 0xrc-hot-experts
+git checkout 0xrc-v0.1.0
 
 uv venv --python 3.11
 source .venv/bin/activate
@@ -37,13 +37,13 @@ Set paths for the local checkpoint and a durable output directory:
 
 ```bash
 export CHAMPION_MODEL=/absolute/path/to/exl3-model
-export CHAMPION_RUN="$PWD/champion-runs/4070ti"
+export CHAMPION_RUN="$PWD/0xrc-runs/4070ti"
 ```
 
 Inspect the machine and model before allocating either GPU or system memory:
 
 ```bash
-exllamav3-champion doctor \
+0xrc-exllamav3 doctor \
   --model "$CHAMPION_MODEL" \
   --json-out "$CHAMPION_RUN/doctor.json"
 ```
@@ -55,7 +55,7 @@ any replaced or modified shard is rehashed.
 Preview the candidate matrix:
 
 ```bash
-exllamav3-champion tune \
+0xrc-exllamav3 tune \
   --model "$CHAMPION_MODEL" \
   --output "$CHAMPION_RUN" \
   --context 8192 \
@@ -67,7 +67,7 @@ exllamav3-champion tune \
 Run qualification. `--resume` reuses only trials whose sealed manifest matches this hardware, model, runtime, workload, and tuning policy, so the same command is safe after an interruption:
 
 ```bash
-exllamav3-champion tune \
+0xrc-exllamav3 tune \
   --model "$CHAMPION_MODEL" \
   --output "$CHAMPION_RUN" \
   --context 8192 \
@@ -79,7 +79,7 @@ exllamav3-champion tune \
   --resume
 ```
 
-The tuner discovers safe-first CPU expert counts, physical-core thread counts, and CPU pinning on/off before expert profiling. It then captures routing over twelve prose/code/reasoning windows and evaluates the learned placement on disjoint held-out windows. The full run starts many fresh model processes and can take a while; logs and JSON evidence are retained under `champion-runs/4070ti/trials/`.
+The tuner discovers safe-first CPU expert counts, physical-core thread counts, and CPU pinning on/off before expert profiling. It then captures routing over twelve prose/code/reasoning windows and evaluates the learned placement on disjoint held-out windows. The full run starts many fresh model processes and can take a while; logs and JSON evidence are retained under `0xrc-runs/4070ti/trials/`.
 
 For a production workload, replace the built-in prompts with `--prompts prompts.json`. The file can be a JSON array or JSONL; each row uses this shape:
 
@@ -96,8 +96,8 @@ Validate the profile seal, then run the independent three-process verification g
 ```bash
 export CHAMPION_PROFILE="$CHAMPION_RUN/champion-profile.json"
 
-exllamav3-champion profile-check "$CHAMPION_PROFILE"
-exllamav3-champion verify "$CHAMPION_PROFILE"
+0xrc-exllamav3 profile-check "$CHAMPION_PROFILE"
+0xrc-exllamav3 verify "$CHAMPION_PROFILE"
 ```
 
 `verify` writes `champion-profile.verification.json`. `serve` refuses to launch if that receipt, the hardware fingerprint, the model fingerprint, or the runtime source identity does not match.
@@ -105,13 +105,13 @@ exllamav3-champion verify "$CHAMPION_PROFILE"
 To inspect the exact runtime environment without launching a backend:
 
 ```bash
-exllamav3-champion serve "$CHAMPION_PROFILE" --print-env
+0xrc-exllamav3 serve "$CHAMPION_PROFILE" --print-env
 ```
 
 To launch an ExLlamaV3 command, use `{champion_args}` where the model, CPU split, worker threads, cache length/quantization, and optional qualified MTP settings should be inserted. Quote the placeholder so the shell does not expand it:
 
 ```bash
-exllamav3-champion serve "$CHAMPION_PROFILE" -- \
+0xrc-exllamav3 serve "$CHAMPION_PROFILE" -- \
   python examples/chat.py '{champion_args}' -mode qwen35
 ```
 

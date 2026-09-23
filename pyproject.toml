@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "exllamav3"
-description = "Inference library for running local LLMs on modern consumer GPUs"
+description = "0xrc — ExLlamaV3 fork with static HOT-expert CPU/GPU offload for large MoE models"
 dynamic = ["version"]
 readme = "README.md"
 requires-python = ">=3.10.11"
 license = "MIT"
 authors = [{ name = "turboderp" }]
-keywords = ["llm", "inference", "gpu", "quantization", "llama"]
+keywords = ["llm", "inference", "gpu", "quantization", "moe", "hot-experts", "exllamav3"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.scripts]
-exllamav3-champion = "exllamav3.champion.cli:main"
+0xrc-exllamav3 = "exllamav3.champion.cli:main"
 
 [project.optional-dependencies]
 eval = [

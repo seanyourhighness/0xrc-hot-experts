@@ -138,8 +138,8 @@ def command_serve(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog = "exllamav3-champion",
-        description = "Qualify and launch the EXL3 Champion runtime",
+        prog = "0xrc-exllamav3",
+        description = "Qualify and launch the 0xrc ExLlamaV3 hot-expert runtime",
     )
     sub = parser.add_subparsers(dest = "command", required = True)
 
@@ -148,7 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json-out", help = "also write the report to this path")
     doctor.set_defaults(func = command_doctor)
 
-    check = sub.add_parser("profile-check", help = "validate a sealed Champion profile")
+    check = sub.add_parser("profile-check", help = "validate a sealed 0xrc profile")
     check.add_argument("profile")
     check.set_defaults(func = command_profile_check)
 

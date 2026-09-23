@@ -1,10 +1,10 @@
-# Champion branch topology
+# 0xrc branch topology
 
 The immutable release snapshot and the upstream-oriented feature branches serve different
 purposes. Do not rewrite the archive refs to make the history look cleaner.
 
 ```text
-30846b8  pre-Champion base
+30846b8  pre-0xrc base
   |
   +-- feature/runtime-correctness       1aafb3b
         |
@@ -76,7 +76,7 @@ python -m pytest -q \
 ## Immutable and release refs
 
 - `archive/champion-runtime-2026-09-22` / `champion-runtime-baseline-2026-09-22` preserve the exact
-  validated four-file Champion runtime at `983c4b0`.
+  validated four-file 0xrc runtime at `983c4b0`.
 - `archive/champion-full-2026-09-22` preserves the runtime plus the original MTP snapshot.
 - `release/champion-runtime-v0.1` contains the installable qualification workflow and is the branch
   users should run.
