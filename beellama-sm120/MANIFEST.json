@@ -28,6 +28,35 @@
     "file": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
     "sha256": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd"
   },
+  "qualification": {
+    "gate": "candidate throughput / matched native GGUF throughput in the same mode, >= 0.95 for E3 and W2, prose and code separate",
+    "ordinary_prefill_ratio": {
+      "e3": 0.99,
+      "w2": 1.0
+    },
+    "ordinary_decode_ratio": {
+      "e3": 0.963,
+      "w2": 0.96
+    },
+    "dflash2_depth4_prose_ratio": {
+      "e3": 0.994,
+      "w2": 1.006
+    },
+    "dflash2_depth4_code_ratio": {
+      "e3": 1.004,
+      "w2": 1.026
+    },
+    "correctness": {
+      "battery": "tools/release-correctness.py",
+      "checks": 32,
+      "failures": 0,
+      "where": "clean extract, minimal environment",
+      "receipt": "receipts/release-correctness.json"
+    },
+    "doctor": "verified all payload and model hashes and passed a launcher smoke for e3, w2 and the stock target",
+    "scope": "RTX 5090, Ubuntu 24.04 under WSL, driver 616.56, one-slot 8K and 32K profiles",
+    "details": "PARITY.md and docs/escha-v047-sm120-parity-ledger.md"
+  },
   "files": {
     "BUILD.md": "d543ec94b562d41ca7bd3e07908521bc3abddc0998ef6fd86f3152db9a9a1d07",
     "FEEDBACK.md": "69f3e82854054c0d590de908bd1f63f498db4a105b68dfa7f3aae8463bac9026",
