@@ -1,4 +1,4 @@
-# L0xRE EXLLAMA-Offload — ExLlamaV3 Hot Experts
+# L0xRE EXLLAMA-Offload — static expert offload for ExLlamaV3
 
 > **Which release should I use?** This repo is part of the **L0xRE** family — see the hub
 > at [seanyourhighness/L0xRE](https://github.com/seanyourhighness/L0xRE) for the catalog,
