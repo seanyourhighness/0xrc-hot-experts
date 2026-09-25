@@ -1,0 +1,48 @@
+--- a/official_bridge_cuda.cu
++++ b/official_bridge_cuda.cu
+@@ -183,7 +183,11 @@
+     return true;
+ }
+ 
+-const char * code_symbol(int K, bool small, int acc_mode) {
++const char * code_symbol(int K, bool small, int acc_mode, bool fast_down) {
++    // Existing vendor instantiation: only the qualified long-IC K3 down shape.
++    if (fast_down) {
++        return "_ZN12escha_escham23escham_code_gemm_kernelILi1ELi3ELi64ELi64ELi3ELb0ELb1EEEvPfP6__halfPKS2_PKtS5_PKfiiii";
++    }
+     if (K == 2 && !small && acc_mode == 0) {
+         return "_ZN12escha_escham23escham_code_gemm_kernelILi1ELi2ELi128ELi64ELi2ELb0ELb1EEEvPfP6__halfPKS2_PKtS5_PKfiiii";
+     }
+@@ -211,11 +215,11 @@
+     return nullptr;
+ }
+ 
+-CUfunction resolve_code(int device, int K, bool small, int acc_mode) {
++CUfunction resolve_code(int device, int K, bool small, int acc_mode, bool fast_down) {
+     if (!load_code_module(device)) {
+         return nullptr;
+     }
+-    const char * symbol = code_symbol(K, small, acc_mode);
++    const char * symbol = code_symbol(K, small, acc_mode, fast_down);
+     if (symbol == nullptr) {
+         g_error = "unsupported raw Escha code-GEMM selection";
+         return nullptr;
+@@ -432,7 +436,8 @@
+             return -1;
+         }
+         const bool small = OC <= 1024;
+-        CUfunction function = resolve_code(device, K, small, acc_mode);
++        const bool fast_down = K == 3 && IC == 17408 && OC == 5120 && acc_mode == 0;
++        CUfunction function = resolve_code(device, K, small, acc_mode, fast_down);
+         if (function == nullptr) {
+             return -1;
+         }
+@@ -450,7 +455,7 @@
+             &accumulation, &output, &input, &packed, &rout, &s_out,
+             &M, &IC, &OC, const_cast<int *>(&output_blocks),
+         };
+-        const int BM = small ? 64 : 128;
++        const int BM = fast_down || small ? 64 : 128;
+         const CUresult status = cuLaunchKernel(
+             function, (unsigned) (OC / 128), (unsigned) ((M + BM - 1) / BM), 1,
+             256, 1, 1, 0, reinterpret_cast<CUstream>(stream), arguments, nullptr);

@@ -1,0 +1,11 @@
+{
+  "status": "isolated speed screening",
+  "source_control_sha256": "19eb49f233fe4cd56466a1cf706fe560d54f8cedc31eaed8dfc03f1bac0a2dbd",
+  "source_candidate_sha256": "c464a96219795396225a20d3962fa191d71cf5bd47ff5a6027145909f4ab8145",
+  "header_sha256": "6cc9fae65e2d68cacdf78a001c8eda78004594277fcd820815dc3d894fa423db",
+  "patch_sha256": "ddf4761942f8dbf174ae8a50806ce2e3941a81374de9c25c229ecdafe8bdf02c",
+  "control_wrapper_sha256": "6634e4d4eeed28d2be9f9f517a7ace89c646bd35608bd2fc092491b63f7aca5b",
+  "candidate_wrapper_sha256": "59d63f96a9452e7a4bafebc67fbd6426fc65826808b00a062787e1a482ea7ce4",
+  "code_gemm_cubin_sha256": "6cdbf1ab440958d570ef0b3425df5fcea14c40f48c02d5774da983514d676d8b",
+  "build_command": "/usr/local/cuda-13.0/bin/nvcc -shared -Xcompiler=-fPIC -O3 -std=c++17 -arch=sm_120a official_bridge_cuda.cu -o libescha_official_bridge_cuda_sm120.so -lcuda"
+}

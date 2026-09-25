@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+export LD_LIBRARY_PATH="$ROOT/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ESCHA_BRIDGE_ROOT="$ROOT/bridge"
+export ESCHA_GDN_CHUNK_BRIDGE_LIBRARY="$ROOT/bridge/libescha_gdn_chunk_bridge_sm120_sglangprefix2045.so"
+export ESCHA_GDN_SGLANG_CUBIN_ROOT="$ROOT/bridge/gdn-sm120-matched"
+export ESCHA_GDN_CHUNK_K1_LIBRARY="$ROOT/bridge/libescha_gdn_chunk_k1_full2048.so"
+set -a
+# shellcheck source=/dev/null
+source "$ROOT/profiles/escha-sm120-bridge.env"
+set +a
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./escha doctor --model native|e3|w2 --model-path /path/to/model.gguf [--report /path/to/report.json]
+  ./escha serve  --model native|e3|w2 --model-path /path/to/model.gguf \
+                 [--profile ordinary-32k|ordinary-8k|dflash-8k] [--draft-path /path/to/dflash.gguf] \
+                 [--port 8080] [additional llama-server flags]
+  ./escha env    --model native|e3|w2 [--profile ordinary-32k|ordinary-8k|dflash-8k]
+                 Print the resolved route environment (used by the parity harness).
+
+Profiles:
+  ordinary-32k  one slot, 32K context, 1024-token microbatch, no speculation (default)
+  ordinary-8k   one slot, 8K context, 2048-token microbatch, no speculation
+  dflash-8k     one slot, 8K context, 512-token microbatch, DFlash2 depth four with --draft-path
+
+Models are external to this runtime asset. The qualified SM120 routes are already
+set by this launcher; do not set kernel-route environment variables by hand.
+EOF
+}
+
+[[ $# -gt 0 ]] || { usage; exit 2; }
+verb=$1
+shift
+
+apply_model_routes() {
+  local model=$1 profile=$2
+  case "$model" in
+    e3)
+      export ESCHA_E3_HEAD_RT=2 ESCHA_E3_HEAD_MROW=8
+      export ESCHA_GDN_CHUNK_BRIDGE=1 ESCHA_GDN_CHUNK_K1=1
+      ;;
+    w2)
+      export ESCHA_OFFICIAL_RAW_DECODE_K3_DOWN_SPLITS=16
+      export ESCHA_GDN_CHUNK_BRIDGE=1 ESCHA_GDN_CHUNK_K1=1
+      case "$profile" in
+        dflash-8k) unset ESCHA_W2_I8_HEAD ;;
+        *)         export ESCHA_W2_I8_HEAD=1 ;;
+      esac
+      ;;
+    native)
+      # Stock GGUF keeps the generally applicable SM120 routes but no
+      # Escha-only bridge: its logits fail that bridge's numerical guard.
+      export ESCHA_GDN_CHUNK_BRIDGE=0
+      unset ESCHA_GDN_CHUNK_K1
+      ;;
+  esac
+}
+
+case "$verb" in
+  doctor)
+    exec python3 "$ROOT/doctor.py" "$@"
+    ;;
+  env)
+    model='native'
+    profile='ordinary-32k'
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --model) [[ $# -ge 2 ]] || { usage; exit 2; }; model=$2; shift 2 ;;
+        --profile) [[ $# -ge 2 ]] || { usage; exit 2; }; profile=$2; shift 2 ;;
+        *) usage; exit 2 ;;
+      esac
+    done
+    case "$model" in native|e3|w2) ;; *) usage; exit 2 ;; esac
+    apply_model_routes "$model" "$profile"
+    while IFS= read -r line; do
+      name=${line%%=*}
+      printf 'export %s=%q\n' "$name" "${!name}"
+    done < <(env | grep -E '^ESCHA_[A-Z0-9_]+=' | sort)
+    printf 'export LD_LIBRARY_PATH=%q\n' "$LD_LIBRARY_PATH"
+    ;;
+  serve)
+    model=''
+    model_path=''
+    draft_path=''
+    profile='ordinary-32k'
+    extras=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --model) [[ $# -ge 2 ]] || { usage; exit 2; }; model=$2; shift 2 ;;
+        --model-path) [[ $# -ge 2 ]] || { usage; exit 2; }; model_path=$2; shift 2 ;;
+        --draft-path) [[ $# -ge 2 ]] || { usage; exit 2; }; draft_path=$2; shift 2 ;;
+        --profile) [[ $# -ge 2 ]] || { usage; exit 2; }; profile=$2; shift 2 ;;
+        *) extras+=("$1"); shift ;;
+      esac
+    done
+    case "$model" in native|e3|w2) ;; *) usage; exit 2 ;; esac
+    [[ -r "$model_path" ]] || { echo "Model unreadable: $model_path" >&2; exit 2; }
+    apply_model_routes "$model" "$profile"
+
+    context=32768
+    ubatch=1024
+    spec_args=()
+    case "$profile" in
+      ordinary-32k) context=32768; ubatch=1024 ;;
+      ordinary-8k)  context=8192;  ubatch=2048 ;;
+      dflash-8k)
+        context=8192; ubatch=512
+        [[ -r "$draft_path" ]] || { echo "DFlash2 draft unreadable: $draft_path" >&2; exit 2; }
+        spec_args=(--spec-type draft-dflash --spec-draft-model "$draft_path"
+                   --spec-draft-n-max 4 -ctkd q4_0 -ctvd q4_0)
+        ;;
+      *) echo "Unknown profile: $profile" >&2; usage; exit 2 ;;
+    esac
+    python3 "$ROOT/doctor.py" --model "$model" --model-path "$model_path"
+    exec "$ROOT/bin/llama-server" -m "$model_path" \
+      -c "$context" -b 2048 -ub "$ubatch" -np 1 -t 8 -ngl 99 -fa on \
+      -ctk kvarn3 -ctv kvarn2 "${spec_args[@]}" --jinja --reasoning off \
+      --host 127.0.0.1 --port 8080 --no-webui \
+      "${extras[@]}"
+    ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac

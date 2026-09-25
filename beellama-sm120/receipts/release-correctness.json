@@ -1,0 +1,207 @@
+{
+  "launcher": "/tmp/escha-clean/escha-beellama-v047-sm120-r9/escha",
+  "checks": [
+    {
+      "check": "e3/ordinary-8k/startup",
+      "ok": true
+    },
+    {
+      "check": "e3/ordinary-8k/aba-identity",
+      "ok": true,
+      "detail": {
+        "tokens": [
+          256,
+          256
+        ],
+        "sha256": "d48e237881bcddf4e2978fb8d7c3151935934272ffafbbd106d999f87f018bfc"
+      }
+    },
+    {
+      "check": "e3/ordinary-8k/retrieval",
+      "ok": true,
+      "detail": "LARKSPUR-7412"
+    },
+    {
+      "check": "e3/ordinary-8k/long-output",
+      "ok": true,
+      "detail": 500
+    },
+    {
+      "check": "w2/ordinary-8k/startup",
+      "ok": true
+    },
+    {
+      "check": "w2/ordinary-8k/aba-identity",
+      "ok": true,
+      "detail": {
+        "tokens": [
+          256,
+          256
+        ],
+        "sha256": "d48e237881bcddf4e2978fb8d7c3151935934272ffafbbd106d999f87f018bfc"
+      }
+    },
+    {
+      "check": "w2/ordinary-8k/retrieval",
+      "ok": true,
+      "detail": "LARKSPUR-7412"
+    },
+    {
+      "check": "w2/ordinary-8k/long-output",
+      "ok": true,
+      "detail": 500
+    },
+    {
+      "check": "e3/dflash-8k/startup",
+      "ok": true
+    },
+    {
+      "check": "e3/dflash-8k/aba-identity",
+      "ok": true,
+      "detail": {
+        "tokens": [
+          256,
+          256
+        ],
+        "sha256": "d48e237881bcddf4e2978fb8d7c3151935934272ffafbbd106d999f87f018bfc"
+      }
+    },
+    {
+      "check": "e3/dflash-8k/retrieval",
+      "ok": true,
+      "detail": "LARKSPUR-7412"
+    },
+    {
+      "check": "e3/dflash-8k/long-output",
+      "ok": true,
+      "detail": 500
+    },
+    {
+      "check": "w2/dflash-8k/startup",
+      "ok": true
+    },
+    {
+      "check": "w2/dflash-8k/aba-identity",
+      "ok": true,
+      "detail": {
+        "tokens": [
+          256,
+          256
+        ],
+        "sha256": "d48e237881bcddf4e2978fb8d7c3151935934272ffafbbd106d999f87f018bfc"
+      }
+    },
+    {
+      "check": "w2/dflash-8k/retrieval",
+      "ok": true,
+      "detail": "LARKSPUR-7412"
+    },
+    {
+      "check": "w2/dflash-8k/long-output",
+      "ok": true,
+      "detail": 500
+    },
+    {
+      "check": "native/ordinary-8k/startup",
+      "ok": true
+    },
+    {
+      "check": "native/ordinary-8k/aba-identity",
+      "ok": true,
+      "detail": {
+        "tokens": [
+          256,
+          256
+        ],
+        "sha256": "d48e237881bcddf4e2978fb8d7c3151935934272ffafbbd106d999f87f018bfc"
+      }
+    },
+    {
+      "check": "native/ordinary-8k/retrieval",
+      "ok": true,
+      "detail": "LARKSPUR-7412"
+    },
+    {
+      "check": "native/ordinary-8k/long-output",
+      "ok": true,
+      "detail": 500
+    },
+    {
+      "check": "native/dflash-8k/startup",
+      "ok": true
+    },
+    {
+      "check": "native/dflash-8k/aba-identity",
+      "ok": true,
+      "detail": {
+        "tokens": [
+          256,
+          256
+        ],
+        "sha256": "d48e237881bcddf4e2978fb8d7c3151935934272ffafbbd106d999f87f018bfc"
+      }
+    },
+    {
+      "check": "native/dflash-8k/retrieval",
+      "ok": true,
+      "detail": "LARKSPUR-7412"
+    },
+    {
+      "check": "native/dflash-8k/long-output",
+      "ok": true,
+      "detail": 500
+    },
+    {
+      "check": "e3/ordinary-32k/startup",
+      "ok": true
+    },
+    {
+      "check": "e3/ordinary-32k/aba-identity",
+      "ok": true,
+      "detail": {
+        "tokens": [
+          256,
+          256
+        ],
+        "sha256": "d48e237881bcddf4e2978fb8d7c3151935934272ffafbbd106d999f87f018bfc"
+      }
+    },
+    {
+      "check": "e3/ordinary-32k/retrieval",
+      "ok": true,
+      "detail": "LARKSPUR-7412"
+    },
+    {
+      "check": "e3/ordinary-32k/long-output",
+      "ok": true,
+      "detail": 500
+    },
+    {
+      "check": "w2/ordinary-32k/startup",
+      "ok": true
+    },
+    {
+      "check": "w2/ordinary-32k/aba-identity",
+      "ok": true,
+      "detail": {
+        "tokens": [
+          256,
+          256
+        ],
+        "sha256": "d48e237881bcddf4e2978fb8d7c3151935934272ffafbbd106d999f87f018bfc"
+      }
+    },
+    {
+      "check": "w2/ordinary-32k/retrieval",
+      "ok": true,
+      "detail": "LARKSPUR-7412"
+    },
+    {
+      "check": "w2/ordinary-32k/long-output",
+      "ok": true,
+      "detail": 500
+    }
+  ],
+  "failures": [],
+  "status": "pass"
+}

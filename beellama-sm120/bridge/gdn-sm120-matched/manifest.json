@@ -1,0 +1,156 @@
+{
+  "cumsum": {
+    "triton_cache_digest": "QSQXVY3XY37E4PQHJA4YX5X3QEFGQK3WVSPSE5EUM4HXOB2IYCBQ",
+    "symbol": "chunk_local_cumsum_scalar_kernel",
+    "source_root": "/home/sean/.triton/cache/QSQXVY3XY37E4PQHJA4YX5X3QEFGQK3WVSPSE5EUM4HXOB2IYCBQ",
+    "files": {
+      "cubin": {
+        "name": "cumsum.cubin",
+        "sha256": "94935a0d150c4b736ef3255e5b86bb6564966b8532ac2b947b0894a6d452639f",
+        "bytes": 14408
+      },
+      "json": {
+        "name": "cumsum.json",
+        "sha256": "a507365ba219d0fc5b83fe4f9b9c22365c193600f626648c04d123292c2a6b21",
+        "bytes": 1106
+      },
+      "ttir": {
+        "name": "cumsum.ttir",
+        "sha256": "7583634508543f288ba9edcc6cef29509472c9623cdda69cd9f641369af16afd",
+        "bytes": 7059
+      }
+    }
+  },
+  "kkt": {
+    "triton_cache_digest": "MFE6FARZ4CXQXLKJT5ODVNARGNDNYFPHOV44OUNTOCONTG2SUWBQ",
+    "symbol": "chunk_scaled_dot_kkt_fwd_kernel",
+    "source_root": "/home/sean/.triton/cache/MFE6FARZ4CXQXLKJT5ODVNARGNDNYFPHOV44OUNTOCONTG2SUWBQ",
+    "files": {
+      "cubin": {
+        "name": "kkt.cubin",
+        "sha256": "b69701c925e29c19094d52d8b7ba9f7a9153c4d4acd143493943f990b5bcf4dc",
+        "bytes": 41672
+      },
+      "json": {
+        "name": "kkt.json",
+        "sha256": "daf2e1b171518ef60eadd41f23823671d941e95f945b6a28e9dac75dda32c3a2",
+        "bytes": 1109
+      },
+      "ttir": {
+        "name": "kkt.ttir",
+        "sha256": "888ba17953884b399a78ae4cadd509006bc6ea9e95dc98f5d491ab4f443673ed",
+        "bytes": 18404
+      }
+    }
+  },
+  "solve": {
+    "triton_cache_digest": "GBCGLDOHUE7KBMO3ZUTAV7O4FLBW6P42U5JWH6ATU2EAYDHN743A",
+    "symbol": "solve_tril_16x16_kernel",
+    "source_root": "/home/sean/.triton/cache/GBCGLDOHUE7KBMO3ZUTAV7O4FLBW6P42U5JWH6ATU2EAYDHN743A",
+    "files": {
+      "cubin": {
+        "name": "solve.cubin",
+        "sha256": "9c2a744851d9f14a28b093e94bc12f3e69a809dafafaf45ba212410efe265842",
+        "bytes": 25616
+      },
+      "json": {
+        "name": "solve.json",
+        "sha256": "983cd430661cd04d266c0b0ed3c72ea8567be6267834a306332f42a4193afd66",
+        "bytes": 1097
+      },
+      "ttir": {
+        "name": "solve.ttir",
+        "sha256": "bec9fce6518352d93bc63c8a750f1aaf2d23c7168251cae432b98c736568d61c",
+        "bytes": 16225
+      }
+    }
+  },
+  "merge": {
+    "triton_cache_digest": "AKRVEY3SV2T456S2MLK6GCLWKKMROLQO65FO3Z62I6VJACFCNWGA",
+    "symbol": "merge_16x16_to_64x64_inverse_kernel",
+    "source_root": "/home/sean/.triton/cache/AKRVEY3SV2T456S2MLK6GCLWKKMROLQO65FO3Z62I6VJACFCNWGA",
+    "files": {
+      "cubin": {
+        "name": "merge.cubin",
+        "sha256": "60a3f95358667eb9b90984554489ef52282f5d1bc180d23ec6a89818cb2fd8a8",
+        "bytes": 80664
+      },
+      "json": {
+        "name": "merge.json",
+        "sha256": "330c77ea13bcc13177a26e5e6a8640d6966d930a9d2955c22f24d2ca9ad14b3f",
+        "bytes": 1113
+      },
+      "ttir": {
+        "name": "merge.ttir",
+        "sha256": "9af98b8b323c5c1c944eb23da31f0b9f0e8c70f78673a16db42c5ad06e7c9663",
+        "bytes": 32866
+      }
+    }
+  },
+  "recompute": {
+    "triton_cache_digest": "QF6QPEDL6L5IH3FPDKKEKMYG73JT57NDABMTGNGDBO2IRGGD5ITA",
+    "symbol": "recompute_w_u_fwd_kernel",
+    "source_root": "/home/sean/.triton/cache/QF6QPEDL6L5IH3FPDKKEKMYG73JT57NDABMTGNGDBO2IRGGD5ITA",
+    "files": {
+      "cubin": {
+        "name": "recompute.cubin",
+        "sha256": "11996c432ca61e65369265caeeb0014c625a811535c056703f6c4389500f1a47",
+        "bytes": 107104
+      },
+      "json": {
+        "name": "recompute.json",
+        "sha256": "aaa4a1e4a4a28a117187016685535fd9706386b7208a55072a83ba83b4b5db8e",
+        "bytes": 1102
+      },
+      "ttir": {
+        "name": "recompute.ttir",
+        "sha256": "bd7399f0f2986dd40d2b4b35bdeecd8498b4f495a6ce5670e93e2e2ee00c2de0",
+        "bytes": 20344
+      }
+    }
+  },
+  "state": {
+    "triton_cache_digest": "423XY3IIXEVD5EHY7TR3OESK3HBB6OV2BRU26P772UUPLI7BZTHQ",
+    "symbol": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+    "source_root": "/home/sean/.triton/cache/423XY3IIXEVD5EHY7TR3OESK3HBB6OV2BRU26P772UUPLI7BZTHQ",
+    "files": {
+      "cubin": {
+        "name": "state.cubin",
+        "sha256": "7cabaae9c9a105955ec0875029b75f305dbf0acbfc0513b1e9531524709dba06",
+        "bytes": 97176
+      },
+      "json": {
+        "name": "state.json",
+        "sha256": "a4a4091a005dade55157149f07546bd50be9cd30d43dafff3b720022ee58c9d0",
+        "bytes": 1124
+      },
+      "ttir": {
+        "name": "state.ttir",
+        "sha256": "80aee4eb33c6d6e2812a9212b0c1b6a1d6ed9e256640f381ed5c145a3160ff50",
+        "bytes": 32153
+      }
+    }
+  },
+  "output": {
+    "triton_cache_digest": "RI7FWLHDZLR4Z5IIERZK7KXHZBOMEEIYIMDLBC7WIEMYMBEUDA5A",
+    "symbol": "chunk_fwd_kernel_o",
+    "source_root": "/home/sean/.triton/cache/RI7FWLHDZLR4Z5IIERZK7KXHZBOMEEIYIMDLBC7WIEMYMBEUDA5A",
+    "files": {
+      "cubin": {
+        "name": "output.cubin",
+        "sha256": "3a1eb73fa637653d949a6a446ba04d1cb478a718e3a8b7dc91e788be4f6736e6",
+        "bytes": 131480
+      },
+      "json": {
+        "name": "output.json",
+        "sha256": "2de0f75e553e8c5c31a52afb2853e12f894d1997be273a5a602dd597ba8a9381",
+        "bytes": 1096
+      },
+      "ttir": {
+        "name": "output.ttir",
+        "sha256": "868c2d61cd9267932991d29e5d731274c6a225a6fef24716dadf3b161695361c",
+        "bytes": 22648
+      }
+    }
+  }
+}

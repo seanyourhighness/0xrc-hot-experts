@@ -1,0 +1,656 @@
+diff -ruN a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+--- a/ggml/src/ggml-cuda/common.cuh	2026-09-24 00:14:52.766113491 -0700
++++ b/ggml/src/ggml-cuda/common.cuh	2026-09-24 14:58:11.292294283 -0700
+@@ -27,6 +27,7 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdio>
++#include <functional>
+ #include <string>
+ #include <unordered_map>
+ #include <utility>
+@@ -1463,6 +1464,23 @@
+     }
+ };
+ 
++struct ggml_cuda_graph_key {
++    const void * first_node_ptr;
++    int n_nodes;
++
++    bool operator==(const ggml_cuda_graph_key & other) const {
++        return first_node_ptr == other.first_node_ptr && n_nodes == other.n_nodes;
++    }
++};
++
++struct ggml_cuda_graph_key_hash {
++    size_t operator()(const ggml_cuda_graph_key & key) const {
++        const size_t first = std::hash<const void *>{}(key.first_node_ptr);
++        const size_t shape = std::hash<int>{}(key.n_nodes);
++        return first ^ (shape + 0x9e3779b97f4a7c15ULL + (first << 6) + (first >> 2));
++    }
++};
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1476,13 +1494,14 @@
+     int curr_stream_no = 0;
+ 
+ #ifdef USE_CUDA_GRAPH
+-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
++    // The same first-node tensor can head different graph shapes (for example,
++    // DFlash feature injection and draft-block decode). Keep their capture
++    // warmup and executable state separate.
++    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
+ 
+     int64_t last_graph_eviction_sweep = 0;
+ 
+-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
++    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
+         const int64_t time_now = ggml_time_us();
+ 
+         // sweep every 5s, evicting cuda graphs unused for >=10s
+@@ -1497,9 +1516,9 @@
+             }
+         }
+ 
+-        auto it = cuda_graphs.find(first_node_ptr);
++        auto it = cuda_graphs.find(key);
+         if (it == cuda_graphs.end()) {
+-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
++            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
+         }
+         it->second->last_used_time = time_now;
+         return it->second.get();
+diff -ruN a/ggml/src/ggml-cuda/escha-moe.cu b/ggml/src/ggml-cuda/escha-moe.cu
+--- a/ggml/src/ggml-cuda/escha-moe.cu	2026-09-24 00:14:53.283600084 -0700
++++ b/ggml/src/ggml-cuda/escha-moe.cu	2026-09-24 16:30:42.946973209 -0700
+@@ -2952,7 +2952,6 @@
+         escha_decode_overlap_resources & resources =
+             escha_decode_overlap_resources_get(ctx.device, stream);
+         escha_decode_gate_pending & pending = g_escha_decode_gate_pending;
+-
+         if (raw_decode_gate) {
+             if (K != 2 || pending.valid) {
+                 GGML_ABORT("escha: gate/up overlap expected one pending K2 gate");
+@@ -3100,8 +3099,8 @@
+             splits /= 2;
+         }
+         if (const char * value = std::getenv("ESCHA_OFFICIAL_RAW_DECODE_K3_DOWN_SPLITS")) {
+-            if (std::strcmp(value, "12") != 0) {
+-                GGML_ABORT("escha: K3 down split override value must be 12");
++            if (std::strcmp(value, "12") != 0 && std::strcmp(value, "16") != 0) {
++                GGML_ABORT("escha: K3 down split override value must be 12 or 16");
+             }
+             if (K == 3 && IC == 17408 && OC == 5120) {
+                 splits = 12;
+@@ -4019,7 +4018,8 @@
+     constexpr int n_rows = 1;
+     constexpr int ic = 17408;
+     constexpr int oc = 5120;
+-    constexpr int splits = 12;
++    const char * split_override = std::getenv("ESCHA_OFFICIAL_RAW_DECODE_K3_DOWN_SPLITS");
++    const int splits = split_override != nullptr && std::strcmp(split_override, "16") == 0 ? 16 : 12;
+     constexpr int groups = oc/ESCHA_NT;
+     constexpr int norm_threads = 1024;
+ 
+@@ -4364,6 +4364,20 @@
+     ggml_cuda_op_escha_mul_mat_impl(ctx, up, gate_silu, mul, false);
+ }
+ 
++void ggml_cuda_op_escha_mul_mat_fused_gate_up(ggml_backend_cuda_context & ctx,
++                                              ggml_tensor * gate,
++                                              ggml_tensor * silu,
++                                              ggml_tensor * up,
++                                              ggml_tensor * mul) {
++    GGML_ASSERT(ggml_cuda_escha_mvt_gate_silu_is_eligible(gate, silu));
++    GGML_ASSERT(ggml_cuda_escha_mvt_up_finalize_is_eligible(up));
++    GGML_ASSERT(up->src[5] == gate->src[5] && up->src[6] == nullptr);
++    GGML_ASSERT(silu->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_are_same_shape(silu, up) && ggml_are_same_shape(up, mul));
++    ggml_cuda_op_escha_mul_mat_impl(ctx, gate, nullptr, silu, true);
++    ggml_cuda_op_escha_mul_mat_impl(ctx, up, silu, mul, false);
++}
++
+ bool ggml_cuda_escha_mvt_gate_silu_is_eligible(const ggml_tensor * gate,
+                                               const ggml_tensor * silu) {
+     const bool candidate_enabled = ggml_backend_cuda_escha_mvt_candidate_enabled(
+diff -ruN a/ggml/src/ggml-cuda/escha-moe.cuh b/ggml/src/ggml-cuda/escha-moe.cuh
+--- a/ggml/src/ggml-cuda/escha-moe.cuh	2026-09-24 00:14:53.283705975 -0700
++++ b/ggml/src/ggml-cuda/escha-moe.cuh	2026-09-24 13:52:44.990908924 -0700
+@@ -12,6 +12,11 @@
+ void ggml_cuda_op_escha_mul_mat_fused_up(ggml_backend_cuda_context & ctx,
+                                          ggml_tensor * up,
+                                          ggml_tensor * mul);
++void ggml_cuda_op_escha_mul_mat_fused_gate_up(ggml_backend_cuda_context & ctx,
++                                              ggml_tensor * gate,
++                                              ggml_tensor * silu,
++                                              ggml_tensor * up,
++                                              ggml_tensor * mul);
+ void ggml_cuda_op_escha_mul_mat_fused_gate_silu(ggml_backend_cuda_context & ctx,
+                                                 ggml_tensor * gate,
+                                                 ggml_tensor * silu);
+diff -ruN a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu	2026-09-24 00:14:53.283833491 -0700
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu	2026-09-24 08:23:07.217031176 -0700
+@@ -28,31 +28,33 @@
+     return value != nullptr && std::strcmp(value, "1") == 0;
+ }
+ 
+-static const escha_gdn_chunk_api & escha_gdn_chunk_load() {
+-    static escha_gdn_chunk_api api;
+-    static std::once_flag once;
+-    std::call_once(once, [] {
++static const escha_gdn_chunk_api & escha_gdn_chunk_load(bool k1_full_batch = false) {
++    static escha_gdn_chunk_api api[2];
++    static std::once_flag once[2];
++    const int index = k1_full_batch ? 1 : 0;
++    std::call_once(once[index], [index] {
+ #if defined(_WIN32)
+         GGML_ABORT("ESCHA GDN chunk bridge is not supported on Windows");
+ #else
+-        const char * path = std::getenv("ESCHA_GDN_CHUNK_BRIDGE_LIBRARY");
++        const char * env_name = index == 1 ? "ESCHA_GDN_CHUNK_K1_LIBRARY" : "ESCHA_GDN_CHUNK_BRIDGE_LIBRARY";
++        const char * path = std::getenv(env_name);
+         if (path == nullptr || path[0] == '\0') {
+-            GGML_ABORT("ESCHA_GDN_CHUNK_BRIDGE_LIBRARY is required");
++            GGML_ABORT("%s is required", env_name);
+         }
+         void * handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+         if (handle == nullptr) {
+             GGML_ABORT("failed to load GDN chunk bridge '%s': %s", path, dlerror());
+         }
+-        api.prefill = reinterpret_cast<escha_gdn_chunk_prefill_fn>(
++        api[index].prefill = reinterpret_cast<escha_gdn_chunk_prefill_fn>(
+             dlsym(handle, "escha_gdn_chunk_prefill"));
+-        api.error = reinterpret_cast<escha_gdn_chunk_error_fn>(
++        api[index].error = reinterpret_cast<escha_gdn_chunk_error_fn>(
+             dlsym(handle, "escha_gdn_chunk_error"));
+-        if (api.prefill == nullptr || api.error == nullptr) {
++        if (api[index].prefill == nullptr || api[index].error == nullptr) {
+             GGML_ABORT("GDN chunk bridge '%s' is missing its C ABI", path);
+         }
+ #endif
+     });
+-    return api;
++    return api[index];
+ }
+ 
+ template <int S_v, bool KDA, bool keep_rs_t, bool grouped_qk_norm, bool fuse_decode_prep>
+@@ -408,23 +410,44 @@
+         state_slot_stride = cache->slot_stride;
+     }
+ 
+-    // The retained Sprint GDN bridge is qualified only for the ordinary
+-    // (non-KDA), one-state, 2048-token Escha prefill shape.  A K==1 cache
+-    // fusion is layout-compatible with the single state output, so allow it;
+-    // multi-slot rollback caches remain excluded by K==1. Keep every other
+-    // shape on BeeLlama's existing CUDA kernel and fail closed on bridge
+-    // errors instead of silently mixing the two state layouts.
++    // K=1 raw prefill uses the full batch bridge. MTP K=3 retains its
++    // 2045-token prefix and native three-token rollback snapshot tail.
++    // Every other shape stays on the native CUDA path.
+     bool chunk_dispatched = false;
+-    if (escha_gdn_chunk_requested() && !kda && !grouped_qk_norm && !keep_rs &&
++    const char * k1_env = std::getenv("ESCHA_GDN_CHUNK_K1");
++    const bool k1_requested = k1_env != nullptr && std::strcmp(k1_env, "1") == 0;
++    if (escha_gdn_chunk_requested() && k1_requested && !kda && !grouped_qk_norm && !keep_rs &&
+             K == 1 && S_v == 128 && H == 48 && n_tokens == 2048 && n_seqs == 1) {
+-        const escha_gdn_chunk_api & api = escha_gdn_chunk_load();
++        const escha_gdn_chunk_api & api = escha_gdn_chunk_load(true);
+         const int status = api.prefill(
+             stream, ggml_cuda_get_device(), q_d, k_d, v_d, g_d, b_d, s_d,
+             dst_d, state_d, S_v, H, n_tokens, n_seqs,
+             sq1, sq2, sv1, sv2, sb1, sb2, scale);
+         if (status != 0) {
+-            GGML_ABORT("ESCHA GDN chunk bridge failed: %s", api.error());
++            GGML_ABORT("ESCHA GDN full-batch K=1 bridge failed: %s", api.error());
++        }
++        chunk_dispatched = true;
++    }
++    if (!chunk_dispatched && escha_gdn_chunk_requested() && !kda && !grouped_qk_norm &&
++            K == 3 && S_v == 128 && H == 48 && n_tokens == 2048 && n_seqs == 1) {
++        constexpr int64_t prefix_tokens = 2045;
++        constexpr int64_t tail_tokens = 3;
++        const escha_gdn_chunk_api & api = escha_gdn_chunk_load();
++        const int status = api.prefill(
++            stream, ggml_cuda_get_device(), q_d, k_d, v_d, g_d, b_d, s_d,
++            dst_d, state_d, S_v, H, prefix_tokens, n_seqs,
++            sq1, sq2, sv1, sv2, sb1, sb2, scale);
++        if (status != 0) {
++            GGML_ABORT("ESCHA GDN chunk prefix bridge failed: %s", api.error());
+         }
++        launch_gated_delta_net<false, true, false>(
++            q_d + prefix_tokens*sq2, k_d + prefix_tokens*sq2,
++            v_d + prefix_tokens*sv2, g_d + prefix_tokens*sb2,
++            b_d + prefix_tokens*sb2, nullptr, nullptr, state_d,
++            dst_d + prefix_tokens*S_v*H, state_d,
++            S_v, H, tail_tokens, n_seqs,
++            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
++            neqk1, rq3, scale, qk_norm_eps, state_slot_stride, K, stream);
+         chunk_dispatched = true;
+     }
+ 
+diff -ruN a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu	2026-09-24 00:14:53.283891757 -0700
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu	2026-09-24 14:58:24.280347608 -0700
+@@ -2734,14 +2734,14 @@
+     return use_cuda_graph;
+ }
+ 
+-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+-    return cgraph->nodes[0];
++static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
++    return { cgraph->nodes[0], cgraph->n_nodes };
+ }
+ 
+ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+     bool res = false;
+ 
+-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
++    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (cgraph->uid != 0 &&
+@@ -2781,7 +2781,7 @@
+     return res;
+ }
+ 
+-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
++static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+ #if CUDART_VERSION >= 12000
+@@ -3735,6 +3735,38 @@
+         }
+     }
+ 
++    // Keep an overlapped raw gate/up pair in one graph visit.  The deferred
++    // gate state is only valid until its matching up dispatch; visiting the
++    // two ordinary fusions separately lets graph capture strand that state.
++    const char * gate_up_overlap = std::getenv("ESCHA_OFFICIAL_RAW_DECODE_GATE_UP_OVERLAP");
++    if (node->op == GGML_OP_ESCHA_MUL_MAT && i + 3 < cgraph->n_nodes &&
++        gate_up_overlap != nullptr && std::strcmp(gate_up_overlap, "1") == 0) {
++        ggml_tensor * silu = cgraph->nodes[i + 1];
++        ggml_tensor * up   = cgraph->nodes[i + 2];
++        ggml_tensor * mul  = cgraph->nodes[i + 3];
++        const bool pair_shape = up->op == GGML_OP_ESCHA_MUL_MAT &&
++            up->src[5] == node->src[5] && up->src[6] == nullptr &&
++            mul->op == GGML_OP_MUL &&
++            ((mul->src[0] == silu && mul->src[1] == up) ||
++             (mul->src[1] == silu && mul->src[0] == up)) &&
++            ggml_cuda_escha_mvt_gate_silu_is_eligible(node, silu) &&
++            ggml_cuda_escha_mvt_up_finalize_is_eligible(up) &&
++            ggml_are_same_shape(silu, up) && ggml_are_same_shape(up, mul) &&
++            silu->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(silu) && ggml_is_contiguous(mul);
++        if (pair_shape) {
++            const int gate_out[] = { i + 1 };
++            const int up_out[]   = { i + 3 };
++            const bool gate_safe = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, gate_out, 1);
++            const bool up_safe = mul->data == silu->data ||
++                ggml_cuda_check_fusion_memory_ranges(cgraph, i + 2, 2, up_out, 1);
++            if (gate_safe && up_safe) {
++                ggml_cuda_op_escha_mul_mat_fused_gate_up(*cuda_ctx, node, silu, up, mul);
++                return 3;
++            }
++        }
++    }
++
+     // Two-sided dense SwiGLU epilogue: fold the gate finalizer into the F32
+     // SiLU node, then let the up finalizer write the following MUL.  This is
+     // the restored sprint route and operates default-on.
+@@ -4677,7 +4709,7 @@
+     return 0;
+ }
+ 
+-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
++static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+     // flag used to determine whether it is an integrated_gpu
+@@ -4899,7 +4931,7 @@
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
+-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
++static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (graph->graph == nullptr) {
+@@ -4922,7 +4954,7 @@
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+-    const void * graph_key = nullptr;
++    ggml_cuda_graph_key graph_key = {};
+ 
+ #ifdef USE_CUDA_GRAPH
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+@@ -5039,7 +5071,7 @@
+     }
+ 
+ #ifdef USE_CUDA_GRAPH
+-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
++    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
+     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ #else
+     const bool use_cuda_graph = false;
+diff -ruN a/ggml/src/ggml-cuda/lowgpu.cu b/ggml/src/ggml-cuda/lowgpu.cu
+--- a/ggml/src/ggml-cuda/lowgpu.cu	2026-09-24 00:14:53.284119372 -0700
++++ b/ggml/src/ggml-cuda/lowgpu.cu	2026-09-24 13:52:49.761681514 -0700
+@@ -301,6 +301,126 @@
+     }
+ }
+ 
++template <int R, int T>
++static __global__ void lowgpu_packed_gemv_rt_kernel(
++        const uint8_t * __restrict__ codes,
++        const half    * __restrict__ scales,
++        const uint8_t * __restrict__ zps,
++        const half    * __restrict__ x,
++        float         * __restrict__ dst,
++        const int KB, const int G, const int ntri, const int n_embd, const int V) {
++    const int row0 = blockIdx.x * R;
++    const int tid  = threadIdx.x;
++
++    float acc[R][T];
++#pragma unroll
++    for (int rr = 0; rr < R; ++rr) {
++#pragma unroll
++        for (int tok = 0; tok < T; ++tok) {
++            acc[rr][tok] = 0.0f;
++        }
++    }
++
++    for (int t = tid; t < ntri; t += blockDim.x) {
++        float xw[T][8];
++#pragma unroll
++        for (int tok = 0; tok < T; ++tok) {
++            const half * xv = x + (size_t) tok*n_embd + 8*t;
++            // M-VERIFY-0015: one 16-byte load instead of four 8-byte half2 loads. The head is
++            // LSU-issue bound (NCU: L1TEX ~80% of peak while L2 sits at 8%), and this removes 3 of
++            // the ~12 activation-path load instructions per (t, token) with identical values.
++            // Alignment: 2*(tok*n_embd + 8*t) bytes, with n_embd = 5120 these are 16-byte multiples
++            // provided the f16 staging buffer is 16-byte aligned, which the pool guarantees.
++            const bool vec16 = (reinterpret_cast<uintptr_t>(xv) & 15u) == 0;
++            half2 h01, h23, h45, h67;
++            if (vec16) {
++                const uint4 raw = *reinterpret_cast<const uint4 *>(xv);
++                h01 = *reinterpret_cast<const half2 *>(&raw.x);
++                h23 = *reinterpret_cast<const half2 *>(&raw.y);
++                h45 = *reinterpret_cast<const half2 *>(&raw.z);
++                h67 = *reinterpret_cast<const half2 *>(&raw.w);
++            } else {
++                h01 = reinterpret_cast<const half2 *>(xv)[0];
++                h23 = reinterpret_cast<const half2 *>(xv)[1];
++                h45 = reinterpret_cast<const half2 *>(xv)[2];
++                h67 = reinterpret_cast<const half2 *>(xv)[3];
++            }
++            const float2 f01 = __half22float2(h01);
++            const float2 f23 = __half22float2(h23);
++            const float2 f45 = __half22float2(h45);
++            const float2 f67 = __half22float2(h67);
++            xw[tok][0] = f01.x; xw[tok][1] = f01.y;
++            xw[tok][2] = f23.x; xw[tok][3] = f23.y;
++            xw[tok][4] = f45.x; xw[tok][5] = f45.y;
++            xw[tok][6] = f67.x; xw[tok][7] = f67.y;
++        }
++#pragma unroll
++        for (int rr = 0; rr < R; ++rr) {
++            if (row0 + rr < V) {
++                const uint8_t * cr = codes  + (size_t) (row0 + rr)*KB;
++                const half    * sr = scales + (size_t) (row0 + rr)*G;
++                const uint8_t * zr = zps    + (size_t) (row0 + rr)*G;
++                const uint8_t b0 = cr[3*t + 0];
++                const uint8_t b1 = cr[3*t + 1];
++                const uint8_t b2 = cr[3*t + 2];
++                const uint8_t q[8] = {
++                    (uint8_t) (b0 & 7), (uint8_t) ((b0 >> 3) & 7),
++                    (uint8_t) (((b0 >> 6) | (b1 << 2)) & 7), (uint8_t) ((b1 >> 1) & 7),
++                    (uint8_t) ((b1 >> 4) & 7), (uint8_t) (((b1 >> 7) | (b2 << 1)) & 7),
++                    (uint8_t) ((b2 >> 2) & 7), (uint8_t) ((b2 >> 5) & 7),
++                };
++                const float scale_v = __half2float(sr[t*8/LOWGPU_GROUP]);
++                const float zp_v    = zr[t*8/LOWGPU_GROUP];
++                float w[8];
++#pragma unroll
++                for (int i = 0; i < 8; ++i) {
++                    w[i] = __half2float(__float2half(((float) q[i] - zp_v)*scale_v));
++                }
++#pragma unroll
++                for (int tok = 0; tok < T; ++tok) {
++                    float s = 0.0f;
++#pragma unroll
++                    for (int i = 0; i < 8; ++i) {
++                        s += w[i]*xw[tok][i];
++                    }
++                    acc[rr][tok] += s;
++                }
++            }
++        }
++    }
++
++    __shared__ float partial[256][R*T];
++#pragma unroll
++    for (int rr = 0; rr < R; ++rr) {
++#pragma unroll
++        for (int tok = 0; tok < T; ++tok) {
++            partial[tid][rr*T + tok] = acc[rr][tok];
++        }
++    }
++    __syncthreads();
++    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++#pragma unroll
++            for (int i = 0; i < R*T; ++i) {
++                partial[tid][i] += partial[tid + stride][i];
++            }
++        }
++        __syncthreads();
++    }
++    if (tid == 0) {
++#pragma unroll
++        for (int rr = 0; rr < R; ++rr) {
++            if (row0 + rr >= V) {
++                break;
++            }
++#pragma unroll
++            for (int tok = 0; tok < T; ++tok) {
++                dst[(size_t) tok*V + (row0 + rr)] = partial[0][rr*T + tok];
++            }
++        }
++    }
++}
++
+ // Four rows per CTA. Each lane emulates eight legacy threads, preserving
+ // their accumulation streams and the exact 256-thread reduction tree.
+ // Packed codes/scales/zero points are consumed directly from the model.
+@@ -423,7 +543,32 @@
+     // full dequantized vocabulary allocation and its bandwidth cost.  Prefill
+     // uses GEMM, but it must not expand the entire vocabulary: that alone is
+     // 2.37 GiB for this 248k x 5120 model and defeats its 12 GiB deployment.
+-    if (n_tokens <= 4) {
++    // Port the SM89 R=2 multi-row verification head for DFlash depth four.
++    // The input staging and kernel use the same FP16 activation/weight
++    // rounding as the retained SM89 implementation.
++    const char * rt_env = std::getenv("ESCHA_E3_HEAD_RT");
++    if (rt_env != nullptr && strcmp(rt_env, "2") == 0 && n_tokens >= 2 && n_tokens <= 5) {
++        const int64_t nx_rt = (int64_t) n_tokens*n_embd;
++        ggml_cuda_pool_alloc<half> xh_rt(ctx.pool(), (size_t) nx_rt);
++        lowgpu_f32_to_f16_kernel<<<(int) ((nx_rt + 255)/256), 256, 0, ctx.stream()>>>(
++                (const float *) x->data, xh_rt.ptr, nx_rt);
++        const uint8_t * rc = (const uint8_t *) code->data;
++        const half * rs = (const half *) scale->data;
++        const uint8_t * rz = (const uint8_t *) zp->data;
++        float * rd = (float *) dst->data;
++        const dim3 grid((V + 1)/2);
++        if      (n_tokens == 2) lowgpu_packed_gemv_rt_kernel<2,2><<<grid, 256, 0, ctx.stream()>>>(rc, rs, rz, xh_rt.ptr, rd, KB, G, ntri, n_embd, V);
++        else if (n_tokens == 3) lowgpu_packed_gemv_rt_kernel<2,3><<<grid, 256, 0, ctx.stream()>>>(rc, rs, rz, xh_rt.ptr, rd, KB, G, ntri, n_embd, V);
++        else if (n_tokens == 4) lowgpu_packed_gemv_rt_kernel<2,4><<<grid, 256, 0, ctx.stream()>>>(rc, rs, rz, xh_rt.ptr, rd, KB, G, ntri, n_embd, V);
++        else                    lowgpu_packed_gemv_rt_kernel<2,5><<<grid, 256, 0, ctx.stream()>>>(rc, rs, rz, xh_rt.ptr, rd, KB, G, ntri, n_embd, V);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++    // DFlash depth four verifies five rows. Opt in to the existing decode
++    // kernel for those rows instead of sending them through prefill GEMM.
++    const char * mrow_env = std::getenv("ESCHA_E3_HEAD_MROW");
++    const int max_decode_rows = mrow_env != nullptr && strcmp(mrow_env, "8") == 0 ? 8 : 4;
++    if (n_tokens <= max_decode_rows) {
+         const char * warp4 = std::getenv("ESCHA_E3_HEAD_WARP4");
+         if (warp4 != nullptr && strcmp(warp4, "1") == 0) {
+             lowgpu_packed_gemv_warp4_exact_kernel<<<dim3((V + 3)/4, n_tokens), 128, 0, ctx.stream()>>>(
+diff -ruN a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+--- a/ggml/src/ggml-cuda/mmvf.cu	2026-09-24 00:14:53.284193653 -0700
++++ b/ggml/src/ggml-cuda/mmvf.cu	2026-09-24 17:51:22.239063854 -0700
+@@ -837,6 +837,13 @@
+             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                 if (ampere_mma_available(cc)) {
++                    // Blackwell verification batches (five rows) route thin F16
++                    // projections to cuBLASLt, whose two-CTA grid underuses the
++                    // device. The vector kernel is the faster qualified route for
++                    // these shapes, so select it without an opt-in flag.
++                    if (cc >= GGML_CUDA_CC_BLACKWELL && ne11 == 5 && src0_ne[1] <= 128) {
++                        return true;
++                    }
+                     return src0_small && ne11 == 1;
+                 }
+                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+diff -ruN a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp	2026-09-24 00:14:53.284759614 -0700
++++ b/src/llama-graph.cpp	2026-09-24 13:12:46.253380416 -0700
+@@ -1473,7 +1473,8 @@
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    // Direct recurrent cache views can make the copy-index input graph-dead.
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+diff -ruN a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+--- a/src/llama-model-loader.cpp	2026-09-24 00:14:53.284994441 -0700
++++ b/src/llama-model-loader.cpp	2026-09-24 11:19:45.223143110 -0700
+@@ -1055,6 +1055,21 @@
+             } break;
+         case GGML_OP_LOWGPU_MUL_MAT:
+             {
++                // W2 stores the vocabulary head as row-scaled signed INT8.
++                // Probe its actual fused op so the unchanged code and scale
++                // tensors can be placed on CUDA for direct-head decode.
++                const char * tensor_name = ggml_get_name(w);
++                const bool w2_code  = strcmp(tensor_name, "output.weight") == 0 && w->type == GGML_TYPE_I8;
++                const bool w2_scale = strcmp(tensor_name, "output.weight_scale") == 0 && w->type == GGML_TYPE_F16;
++                if (w2_code || w2_scale) {
++                    const int64_t n_embd = hparams.n_embd;
++                    const int64_t V = w2_code ? w->ne[1] : w->ne[0];
++                    ggml_tensor * code  = w2_code ? w : ggml_new_tensor_2d(ctx, GGML_TYPE_I8, n_embd, V);
++                    ggml_tensor * scale = w2_scale ? w : ggml_new_tensor_1d(ctx, GGML_TYPE_F16, V);
++                    ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
++                    op_tensor = ggml_lowgpu_mul_mat(ctx, code, scale, nullptr, x);
++                    break;
++                }
+                 // E3 packed 3-bit LM head.  w is one of the three packed
+                 // sidecar tensors; rebuild them at the implied shape and probe
+                 // the fused decode-GEMM against a small hidden vector.
+@@ -1305,7 +1320,15 @@
+         const bool is_escha_dense = hparams.n_expert == 0;
+ 
+         ggml_op op;
+-        if (tn.suffix != nullptr && strncmp(tn.suffix, "escha_", 6) == 0) {
++        const char * i8_head_env = std::getenv("ESCHA_W2_I8_HEAD");
++        const bool w2_direct_head = llm_kv.arch == LLM_ARCH_ESCHA &&
++            i8_head_env != nullptr && strcmp(i8_head_env, "1") == 0 &&
++            tn_tensor == LLM_TENSOR_OUTPUT &&
++            ((t_meta->type == GGML_TYPE_I8 && strcmp(ggml_get_name(t_meta), "output.weight") == 0) ||
++             (t_meta->type == GGML_TYPE_F16 && strcmp(ggml_get_name(t_meta), "output.weight_scale") == 0));
++        if (w2_direct_head) {
++            op = GGML_OP_LOWGPU_MUL_MAT;
++        } else if (tn.suffix != nullptr && strncmp(tn.suffix, "escha_", 6) == 0) {
+             op = is_escha_dense ? GGML_OP_ESCHA_MUL_MAT : GGML_OP_ESCHA_MOE;
+         } else if (info.op == GGML_OP_ESCHA_MOE && is_escha_dense) {
+             op = GGML_OP_ESCHA_MUL_MAT;
+@@ -1344,6 +1367,15 @@
+         switch (info.layer) {
+             case LLM_TENSOR_LAYER_INPUT:
+                 buft_list = buft_list_input;
++                // The small shared Escha decode tables are read by GPU kernels
++                // every token. Keep them with the offloaded output weights so
++                // the scheduler does not copy them across backends each step.
++                if (llm_kv.arch == LLM_ARCH_ESCHA &&
++                    (tn_tensor == LLM_TENSOR_ESCHA_LUT ||
++                     tn_tensor == LLM_TENSOR_ESCHA_DEP_K2 ||
++                     tn_tensor == LLM_TENSOR_ESCHA_DEP_K3)) {
++                    buft_list = buft_list_output;
++                }
+                 // Escha E3 prefill gathers on CUDA. Keeping the packed embedding on
+                 // CPU causes all three sidecars (~507 MB) to cross PCIe on every
+                 // request. Reuse the output placement policy so the unchanged packed
+diff -ruN a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+--- a/src/models/delta-net-base.cpp	2026-09-24 00:14:53.285184135 -0700
++++ b/src/models/delta-net-base.cpp	2026-09-24 13:37:31.891691656 -0700
+@@ -460,7 +460,8 @@
+         ggml_tensor *        qkv_mixed,
+         int64_t              conv_kernel_size,
+         int64_t              conv_channels,
+-        int                  il) {
++        int                  il,
++        bool                 direct_conv_state) {
+     const auto * mctx_cur = inp->mctx;
+ 
+     const auto kv_head  = mctx_cur->get_head();
+@@ -468,7 +469,14 @@
+ 
+     const int64_t n_seqs = ubatch.n_seqs;
+ 
+-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
++    // R258's direct SSM-state view also applies to the convolution state in
++    // the exact steady-state M=1 case.  Reading the cache row in place avoids
++    // the generic gather and lets R260 fuse concat, cache shift and conv.
++    ggml_tensor * conv_states = direct_conv_state
++        ? ggml_view_2d(ctx0, conv_states_all,
++                hparams.n_embd_r(), 1, conv_states_all->nb[1],
++                kv_head * conv_states_all->nb[1])
++        : build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+     cb(conv_states, "conv_states", il);
+ 
+     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+diff -ruN a/src/models/models.h b/src/models/models.h
+--- a/src/models/models.h	2026-09-24 00:14:53.285305130 -0700
++++ b/src/models/models.h	2026-09-24 13:08:20.844246855 -0700
+@@ -84,7 +84,8 @@
+             ggml_tensor *        qkv_mixed,
+             int64_t              conv_kernel_size,
+             int64_t              conv_channels,
+-            int                  il);
++            int                  il,
++            bool                 direct_conv_state = false);
+ 
+     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
+     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+diff -ruN a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+--- a/src/models/qwen35.cpp	2026-09-24 00:14:53.285344021 -0700
++++ b/src/models/qwen35.cpp	2026-09-24 13:08:20.848246870 -0700
+@@ -620,8 +620,6 @@
+     const int64_t conv_kernel_size = conv_kernel->ne[0];
+     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+ 
+-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+-
+     // R258: for the single-token, single-sequence decode path the recurrent
+     // state is already laid out as one contiguous slot.  A direct view avoids
+     // the generic recurrent-state gather graph while retaining that graph for
+@@ -634,6 +632,9 @@
+         cparams.n_rs_seq == 0 && mctx_cur->get_n_rs() == 1 &&
+         mctx_cur->s_copy(0) == (int32_t) mctx_cur->get_head();
+ 
++    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed,
++            conv_kernel_size, conv_channels, il, direct_recurrent_state);
++
+     ggml_tensor * state = direct_recurrent_state
+         ? ggml_view_2d(ctx0, ssm_states_all,
+                 hparams.n_embd_s(), 1, ssm_states_all->nb[1],
