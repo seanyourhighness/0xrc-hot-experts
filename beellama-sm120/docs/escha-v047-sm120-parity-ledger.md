@@ -1830,3 +1830,98 @@ larger, higher-risk kernel change than the dispatch work so far, so it is
 carried as the improvement track while the release proceeds on the measured
 pass. Receipts: gdn18/m1-{e3,w2,native}-route-ncu.csv.
 
+## REL-04 — packaged release runtime, qualification, and publication
+
+Release candidate: escha-beellama-v047-sm120-r9. Unlike every earlier asset,
+this runtime is built from ONE source tree (escha-sm120-sprint-r258conv-rt2),
+which contains all qualified changes, so every arm of every comparison loads
+the same libllama and libggml-cuda. Earlier sprints stacked overlay libraries,
+which meant the Escha arms and the native control could load different
+libllama builds. That is fixed here.
+
+Build: local Release, CUDA 13.0.88, CMAKE_CUDA_ARCHITECTURES=120a,
+GGML_CUDA/FA/KVARN on, GGML_NATIVE off, LLAMA_CURL off, prebuilt UI disabled,
+CMAKE_INSTALL_RPATH=$ORIGIN. Runtime hashes: libllama.so.0.4.7
+d3df7954c68202ab1062228b77e469faa6254e347df4d5c3560762b5214475e0,
+libggml-cuda.so.0.23.0 db032fec0f0d3b29306401d368ca8f5a5ab2820c06293744c24e0a0c2a0cecbe,
+llama-server 67992606909b6b13197265988680173256f0fb143cb6fe2baa46d7dbd5d489ab.
+Every ELF carries RUNPATH $ORIGIN only; no build-tree or conda path remains in
+the payload.
+
+Exact source patch: escha-v047-sm120-r9-source.patch, SHA-256
+9ab0b03242a99718edbbd6b715ca4c5b7e173937c6e702f3f1ab9e4b407b4d16. It changes
+12 files against pinned Preview 1156b183 and applies cleanly to a fresh
+checkout of that commit.
+
+The M=5 F16 verification dispatch is now unconditional for cc >= 1200 with
+five input rows and at most 128 output rows, so the shipped runtime selects it
+without any environment variable. The launcher resolves every model-specific
+route itself: E3 multi-row head, W2 original-INT8 head for ordinary decode and
+multi-row head for five-row verification, Escha K=1 GDN prefill bridge, and the
+shared SM120 coded-projection, attention and overlap routes.
+
+### Packaged-build parity (shipped launcher, shipped payload)
+
+Ordinary cells, llama-bench, KVarN3/2, one library for all three targets:
+
+| Cell | Native | E3 | E3 ratio | W2 | W2 ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prefill p2048 UB2048 | 3207.35 | 3176.22 | 0.9903 | 3207.50 | 1.0000 |
+| Decode p0 n256 UB512 | 91.25 | 87.91 | 0.9634 | 87.62 | 0.9602 |
+
+Re-measured from the freshly extracted archive to confirm the shipped bytes:
+native prefill 3239.73, E3 3188.16 (0.9841), W2 3191.73 (0.9852); native
+decode 89.39, E3 87.72 (0.9813), W2 87.45 (0.9783).
+
+DFlash2 depth four through the launcher, four interleaved fresh-start rounds of
+five measured requests each with every request forced to 500 output tokens:
+
+| Cell | Native | E3 | E3 ratio | W2 | W2 ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prose | 125.38 | 124.68 | 0.9944 | 126.07 | 1.0055 |
+| Code | 172.64 | 173.29 | 1.0037 | 177.15 | 1.0261 |
+
+Per-round prose ratios ranged 0.912-1.054 for E3 and 0.953-1.031 for W2, and
+code 0.984-1.018 for E3, because the native control drifts between fresh starts
+while the Escha side is stable. Quote the pooled means and carry the range.
+
+### Correctness and integration, from a clean extract
+
+The archive was extracted to a directory outside the development tree and
+driven with a minimal environment. doctor verified all 100 payload files, the
+SM120 GPU and the model hashes, and passed a launcher, health and
+control-output smoke for e3, w2 and the stock target. tools/release-correctness.py
+then passed 32/32 checks over eight model/profile combinations: startup, a
+deterministic 256-token A/B/A identity check, retrieval at roughly 4K tokens,
+and a forced 500-token completion, for E3, W2 and the stock target on both
+ordinary-8k and dflash-8k plus the 32K profile. Receipt:
+receipts/release-correctness.json.
+
+Two packaging defects were found and fixed by this test rather than shipped:
+the Escha K=1 GDN prefill bridge was missing from the payload and from the
+profile, and doctor could not find nvidia-smi under WSL because it lives in
+/usr/lib/wsl/lib. doctor now searches that location.
+
+### Publication
+
+Repository seanyourhighness/0xrc-hot-experts, dedicated branch
+release/beellama-sm120-v0.4.7 at commit 974e57148cb8d6331db26882b12f9a68b34f63bb,
+namespaced tag beellama-sm120-v0.4.7-r9. The component lives under
+beellama-sm120/ and is separate from the ExLlamaV3 product; existing releases
+and tags are unchanged. Release asset escha-beellama-v047-sm120-r9.tar.zst
+SHA-256 4a57f20e64e5c283af4355564e7505376657f94af1cef0971d091d863b26b503,
+574371201 bytes, matching the digest GitHub computed after upload. Release URL:
+https://github.com/seanyourhighness/0xrc-hot-experts/releases/tag/beellama-sm120-v0.4.7-r9
+
+### Remaining improvement track (not a release blocker)
+
+The ordinary-decode margin is narrow because Escha runs 400 coded-projection
+GEMV launches plus 400 separate split-K finalize launches per token, while the
+native fused matvec needs no reduction launch; that family is essentially the
+entire remaining penalty (REL-03). Folding the ordered split sum, the
+Sylvester-Hadamard stage and the rout scale into the last split CTA is the
+structural fix, for which an older lab prototype exists at
+kernel-lab5090/lab/escha_last_split_finalize_r215. It would also help the
+five-row verification path. It is larger and riskier than the dispatch work so
+far and is carried as a follow-up, not as a condition of this release.
+
