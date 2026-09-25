@@ -18,8 +18,8 @@ The public branch topology and upstream-validation order are documented in
 Linux or WSL2, a working NVIDIA driver, AVX2, Git, and `uv` are required. The model must already be an EXL3 checkpoint on a fast local filesystem.
 
 ```bash
-git clone https://github.com/seanyourhighness/0xrc-hot-experts.git
-cd 0xrc-hot-experts
+git clone https://github.com/seanyourhighness/L0xRE-EXLLAMA-Offload.git
+cd L0xRE-EXLLAMA-Offload
 git checkout 0xrc-v0.1.0
 
 uv venv --python 3.11

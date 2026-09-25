@@ -1,8 +1,13 @@
-# 0xrc — ExLlamaV3 Hot Experts
+# L0xRE EXLLAMA-Offload — ExLlamaV3 Hot Experts
+
+> **Which release should I use?** This repo is part of the **L0xRE** family — see the hub
+> at [seanyourhighness/L0xRE](https://github.com/seanyourhighness/L0xRE) for the catalog,
+> the BeeLLama runtimes, and the L0xRE-27b-Low model. This product ships **static**
+> profile-based hot-expert offload; adaptive swapping is experimental and shelved (below).
 
 **A correctness-gated, hardware-adaptive ExLlamaV3 fork for large MoE models that need GPU/CPU expert offload.**
 
-[0xrc v0.1.0](https://github.com/seanyourhighness/0xrc-hot-experts/releases/tag/0xrc-v0.1.0) ·
+[0xrc v0.1.0](https://github.com/seanyourhighness/L0xRE-EXLLAMA-Offload/releases/tag/0xrc-v0.1.0) ·
 [Runtime guide](doc/0xrc_runtime.md) · [Published evidence](benchmarks/README.md) ·
 [Branch map](doc/0xrc_branches.md) · [Upstream ExLlamaV3](https://github.com/turboderp-org/exllamav3)
 
@@ -18,9 +23,10 @@ doctor → tune hardware → capture routing → compare static/adaptive → ver
 ```
 
 It fingerprints the machine, checkpoint, workload, and executable runtime; searches CPU expert
-split, physical-core worker count, pinning, and optional MTP settings; learns which experts are hot;
-and enables adaptive expert swapping only when repeated fresh-process tests pass correctness,
-memory, and throughput gates.
+split, physical-core worker count, pinning, and optional MTP settings; learns which experts are hot, and seals a **static** hot-expert placement after correctness,
+memory, and throughput gates pass. Adaptive (dynamic) swapping is prototyped but **shelved**
+— it is not hash-stable across runs, is not enabled by default, and is not part of the
+qualified release claim.
 
 ## Why this fork exists
 
@@ -84,8 +90,8 @@ Requirements: Linux or WSL2, NVIDIA driver, AVX2, Git, `uv`, and an EXL3 checkpo
 filesystem. PyTorch must be installed before the extension is built.
 
 ```bash
-git clone https://github.com/seanyourhighness/0xrc-hot-experts.git
-cd 0xrc-hot-experts
+git clone https://github.com/seanyourhighness/L0xRE-EXLLAMA-Offload.git
+cd L0xRE-EXLLAMA-Offload
 git checkout 0xrc-v0.1.0
 
 uv venv --python 3.11
@@ -98,7 +104,7 @@ MAX_JOBS=4 uv pip install --no-build-isolation -e .
 
 Use the immutable tag for a result you intend to publish. The moving
 `release/champion-runtime-v0.1` branch is for evaluating the next candidate. Release assets and
-checksums are on the [GitHub releases page](https://github.com/seanyourhighness/0xrc-hot-experts/releases).
+checksums are on the [GitHub releases page](https://github.com/seanyourhighness/L0xRE-EXLLAMA-Offload/releases).
 
 ## Profile and qualify your machine
 
@@ -137,7 +143,12 @@ For production use, pass representative JSON/JSONL prompts with `--prompts`. See
 [runtime guide](doc/0xrc_runtime.md) for the schema, retained artifacts, optional MTP pass, and
 backend launch placeholders.
 
-## What “adaptive” means here
+## What “adaptive” means here (experimental / shelved)
+
+> [!WARNING]
+> Adaptive (dynamic) expert swapping was prototyped but is **not hash-stable across runs**
+> and has been set aside. It is not enabled by default and must not be relied on in this
+> release. The description below documents the shelved promotion protocol for future work.
 
 Adaptive swapping is not enabled merely because it exists. The tuner first captures routing and
 builds a static hot-to-cold expert placement. It then alternates three fresh static and three fresh
