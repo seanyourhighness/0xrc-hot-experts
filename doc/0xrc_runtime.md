@@ -43,7 +43,7 @@ export CHAMPION_RUN="$PWD/0xrc-runs/4070ti"
 Inspect the machine and model before allocating either GPU or system memory:
 
 ```bash
-0xrc-exllamav3 doctor \
+l0xre-exllamav3 doctor \
   --model "$CHAMPION_MODEL" \
   --json-out "$CHAMPION_RUN/doctor.json"
 ```
@@ -55,7 +55,7 @@ any replaced or modified shard is rehashed.
 Preview the candidate matrix:
 
 ```bash
-0xrc-exllamav3 tune \
+l0xre-exllamav3 tune \
   --model "$CHAMPION_MODEL" \
   --output "$CHAMPION_RUN" \
   --context 8192 \
@@ -67,7 +67,7 @@ Preview the candidate matrix:
 Run qualification. `--resume` reuses only trials whose sealed manifest matches this hardware, model, runtime, workload, and tuning policy, so the same command is safe after an interruption:
 
 ```bash
-0xrc-exllamav3 tune \
+l0xre-exllamav3 tune \
   --model "$CHAMPION_MODEL" \
   --output "$CHAMPION_RUN" \
   --context 8192 \
@@ -96,8 +96,8 @@ Validate the profile seal, then run the independent three-process verification g
 ```bash
 export CHAMPION_PROFILE="$CHAMPION_RUN/champion-profile.json"
 
-0xrc-exllamav3 profile-check "$CHAMPION_PROFILE"
-0xrc-exllamav3 verify "$CHAMPION_PROFILE"
+l0xre-exllamav3 profile-check "$CHAMPION_PROFILE"
+l0xre-exllamav3 verify "$CHAMPION_PROFILE"
 ```
 
 `verify` writes `champion-profile.verification.json`. `serve` refuses to launch if that receipt, the hardware fingerprint, the model fingerprint, or the runtime source identity does not match.
@@ -105,13 +105,13 @@ export CHAMPION_PROFILE="$CHAMPION_RUN/champion-profile.json"
 To inspect the exact runtime environment without launching a backend:
 
 ```bash
-0xrc-exllamav3 serve "$CHAMPION_PROFILE" --print-env
+l0xre-exllamav3 serve "$CHAMPION_PROFILE" --print-env
 ```
 
 To launch an ExLlamaV3 command, use `{champion_args}` where the model, CPU split, worker threads, cache length/quantization, and optional qualified MTP settings should be inserted. Quote the placeholder so the shell does not expand it:
 
 ```bash
-0xrc-exllamav3 serve "$CHAMPION_PROFILE" -- \
+l0xre-exllamav3 serve "$CHAMPION_PROFILE" -- \
   python examples/chat.py '{champion_args}' -mode qwen35
 ```
 

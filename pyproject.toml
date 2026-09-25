@@ -32,7 +32,8 @@ dependencies = [
 ]
 
 [project.scripts]
-0xrc-exllamav3 = "exllamav3.champion.cli:main"
+l0xre-exllamav3 = "exllamav3.champion.cli:main"
+0xrc-exllamav3 = "exllamav3.champion.cli:main"  # legacy alias, same entrypoint
 
 [project.optional-dependencies]
 eval = [

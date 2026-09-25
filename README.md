@@ -40,7 +40,7 @@ This fork adds four separable layers on top of upstream ExLlamaV3:
 - deterministic CPU-MoE reduction and CPU worker/K3 correctness fixes;
 - profile-based static hot-expert placement, which is the safe default;
 - opt-in, profile-seeded adaptive hot-expert swapping with checkpoint-ID-safe remapping;
-- an installable `0xrc-exllamav3` workflow that records every trial and fails closed.
+- an installable `l0xre-exllamav3` workflow that records every trial and fails closed.
 
 The focused review branches and their tests are documented in
 [the branch map](doc/0xrc_branches.md). MTP work remains isolated so the base runtime can be
@@ -99,7 +99,7 @@ source .venv/bin/activate
 uv pip install torch setuptools wheel ninja --torch-backend=auto
 MAX_JOBS=4 uv pip install --no-build-isolation -e .
 
-0xrc-exllamav3 --help
+l0xre-exllamav3 --help
 ```
 
 Use the immutable tag for a result you intend to publish. The moving
@@ -114,11 +114,11 @@ Start without MTP so CPU offload and expert placement are isolated:
 export CHAMPION_MODEL=/absolute/path/to/exl3-model
 export CHAMPION_RUN="$PWD/0xrc-runs/my-machine"
 
-0xrc-exllamav3 doctor \
+l0xre-exllamav3 doctor \
   --model "$CHAMPION_MODEL" \
   --json-out "$CHAMPION_RUN/doctor.json"
 
-0xrc-exllamav3 tune \
+l0xre-exllamav3 tune \
   --model "$CHAMPION_MODEL" \
   --output "$CHAMPION_RUN" \
   --context 8192 \
@@ -130,9 +130,9 @@ export CHAMPION_RUN="$PWD/0xrc-runs/my-machine"
   --resume
 
 export CHAMPION_PROFILE="$CHAMPION_RUN/champion-profile.json"
-0xrc-exllamav3 profile-check "$CHAMPION_PROFILE"
-0xrc-exllamav3 verify "$CHAMPION_PROFILE"
-0xrc-exllamav3 serve "$CHAMPION_PROFILE" --print-env
+l0xre-exllamav3 profile-check "$CHAMPION_PROFILE"
+l0xre-exllamav3 verify "$CHAMPION_PROFILE"
+l0xre-exllamav3 serve "$CHAMPION_PROFILE" --print-env
 ```
 
 `--resume` reuses only trials whose sealed inputs still match. The first model fingerprint streams
